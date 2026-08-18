@@ -29,4 +29,13 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const run_jsontest = b.addRunArtifact(exe);
+    run_jsontest.setCwd(b.path("."));
+    run_jsontest.addArg("jsontest");
+    if (b.option([]const u8, "jsontest-path", "EEST JSON file or directory")) |path| {
+        run_jsontest.addArg(path);
+    }
+    const jsontest_step = b.step("jsontest", "Run execution-spec state tests");
+    jsontest_step.dependOn(&run_jsontest.step);
 }

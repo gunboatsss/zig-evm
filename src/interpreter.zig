@@ -6,6 +6,7 @@ const opcode_mod = @import("opcode.zig");
 const precompile = @import("precompile.zig");
 const cheatcode = @import("cheatcode.zig");
 const rlp = @import("rlp.zig");
+const delegation = @import("delegation.zig");
 const stack_mod = @import("stack.zig");
 const state_mod = @import("state.zig");
 const word = @import("u256.zig");
@@ -37,12 +38,16 @@ pub const Frame = struct {
     is_static: bool,
     kind: CallKind,
     code_address: u256,
+    disable_precompiles: bool,
     out_offset: u32,
     out_size: u32,
     pool_mark: u32,
     journal_mark: u32,
+    refund_mark: i64,
     log_mark: u32,
     log_data_mark: u32,
+    created_mark: u32,
+    delete_mark: u32,
     mem_offset: u32,
 };
 
@@ -53,6 +58,19 @@ pub const Log = struct {
     data_off: u32,
     data_len: u32,
 };
+
+const AccessedSlot = struct {
+    address: u256,
+    key: u256,
+    original: u256,
+};
+
+pub const AccessListItem = struct {
+    address: u256,
+    keys: []const u256,
+};
+
+pub const Authorization = delegation.Authorization;
 
 pub const Vm = struct {
     world: world_mod.World,
@@ -66,6 +84,8 @@ pub const Vm = struct {
     output_len: u32,
     accessed: [limits.accessed_addresses_max]u256,
     accessed_count: u32,
+    accessed_slots: [limits.accessed_storage_max]AccessedSlot,
+    accessed_slot_count: u32,
     logs: [limits.logs_max]Log,
     log_count: u32,
     log_data: [limits.log_data_pool_bytes_max]u8,
@@ -75,6 +95,13 @@ pub const Vm = struct {
     env: state_mod.ExecutionContext,
     cheats: cheatcode.State,
     cheats_enabled: bool,
+    gas_refund: i64,
+    access_list: []const AccessListItem,
+    authorizations: []const delegation.Authorization,
+    created_this_tx: [limits.accounts_max]u256,
+    created_count: u32,
+    deleted: [limits.accounts_max]u256,
+    delete_count: u32,
 
     pub fn init(
         self: *Vm,
@@ -93,6 +120,7 @@ pub const Vm = struct {
         self.last_return_len = 0;
         self.output_len = 0;
         self.accessed_count = 0;
+        self.accessed_slot_count = 0;
         self.log_count = 0;
         self.log_data_used = 0;
         self.fork = fork;
@@ -100,6 +128,11 @@ pub const Vm = struct {
         self.env = context;
         self.cheats = .{};
         self.cheats_enabled = false;
+        self.gas_refund = 0;
+        self.access_list = &.{};
+        self.authorizations = &.{};
+        self.created_count = 0;
+        self.delete_count = 0;
         try self.world.set_code(context.address, code);
         self.world.journal_count = 0;
         try self.warm_precompiles();
@@ -136,6 +169,8 @@ pub const Vm = struct {
         self.env = state_mod.ExecutionContext.default();
         self.cheats = .{};
         self.cheats_enabled = false;
+        self.access_list = &.{};
+        self.authorizations = &.{};
         self.reset_tx();
     }
 
@@ -146,13 +181,14 @@ pub const Vm = struct {
         value: u256,
         context: state_mod.ExecutionContext,
     ) !u256 {
-        std.debug.assert(gas_limit > 0);
         std.debug.assert(init_code.len <= limits.init_code_bytes_max);
         self.reset_tx();
         try self.warm_precompiles();
+        try self.warm_access_list();
         const sender = context.caller;
         try self.mark_warm(sender);
         try self.mark_warm(context.origin);
+        try self.mark_warm(self.env.coinbase);
         const nonce = self.world.get_nonce(sender);
         const address = rlp.create_address(sender, nonce);
         try self.world.increment_nonce(sender);
@@ -174,7 +210,7 @@ pub const Vm = struct {
             .should_transfer = true,
             .value = value,
         });
-        try self.run();
+        self.run_or_fault();
         const frame = self.current();
         const success = frame.status == .returned or frame.status == .stopped;
         if (!success) return 0;
@@ -199,36 +235,40 @@ pub const Vm = struct {
         value: u256,
         context: state_mod.ExecutionContext,
     ) !Status {
-        std.debug.assert(gas_limit > 0);
         std.debug.assert(calldata.len <= limits.calldata_bytes_max);
         self.reset_tx();
         try self.warm_precompiles();
+        try self.warm_access_list();
         try self.mark_warm(to);
         try self.mark_warm(context.caller);
         try self.mark_warm(context.origin);
+        try self.mark_warm(self.env.coinbase);
+        try self.apply_authorizations();
+        const resolved = try self.follow_tx_delegation(to);
         var child_context = context;
         child_context.address = to;
         child_context.call_value = value;
         try self.push_message(.{
-            .code = self.world.code_of(to),
+            .code = resolved.code,
             .calldata = calldata,
             .gas_limit = gas_limit,
             .context = child_context,
             .depth = 0,
             .is_static = false,
             .kind = .call,
-            .code_address = to,
+            .code_address = resolved.address,
+            .disable_precompiles = resolved.disable_precompiles,
             .out_offset = 0,
             .out_size = 0,
             .should_transfer = value != 0,
             .value = value,
         });
-        try self.run();
+        self.run_or_fault();
         return self.current().status;
     }
 
-    /// One state-test transaction: bump sender nonce, then CALL or CREATE.
-    /// Gas fees are not charged; compare `post.state` storage/code, not balances of the sender.
+    /// One state-test transaction: charge gas, bump nonce, CALL or CREATE, then settle fees.
+    /// Cold accounts that are never touched stay unloaded (pre-state only).
     pub fn apply_tx(
         self: *Vm,
         to: ?u256,
@@ -237,16 +277,47 @@ pub const Vm = struct {
         value: u256,
         sender: u256,
     ) !Status {
+        if (self.authorizations.len != 0 and to == null) return error.InvalidTx;
+        const intrinsic = gas_mod.intrinsic_gas(data, to == null) + self.access_list_gas() +
+            @as(u64, self.authorizations.len) * gas_mod.gas_auth_per_empty;
+        if (gas_limit < intrinsic) return error.IntrinsicGas;
+        const fees = gas_mod.fees_from_prices(self.env.gas_price, self.env.base_fee);
+        const upfront = @as(u256, gas_limit) * fees.effective;
+        const sender_bal = self.world.get_balance(sender);
+        if (sender_bal < upfront + value) return error.InsufficientFunds;
+        try self.world.set_balance(sender, sender_bal - upfront);
+        self.env.gas_price = fees.effective;
         var ctx = self.env;
         ctx.caller = sender;
         ctx.origin = sender;
         ctx.call_value = value;
+        ctx.gas_price = fees.effective;
+        const exec_gas = gas_limit - intrinsic;
         if (to) |dest| {
             try self.world.increment_nonce(sender);
-            return self.apply_message(dest, data, gas_limit, value, ctx);
+            const status = try self.apply_message(dest, data, exec_gas, value, ctx);
+            if (status == .returned or status == .stopped) try self.destroy_deleted();
+        } else {
+            const created = try self.apply_create(data, exec_gas, value, ctx);
+            if (created != 0) try self.destroy_deleted();
         }
-        _ = try self.apply_create(data, gas_limit, value, ctx);
+        try self.settle_gas(sender, gas_limit, fees, gas_mod.calldata_floor_gas(data));
         return self.current().status;
+    }
+
+    fn settle_gas(self: *Vm, sender: u256, gas_limit: u64, fees: gas_mod.TxFees, floor: u64) !void {
+        std.debug.assert(self.frame_count >= 1);
+        const used = gas_mod.settled_gas_used(
+            gas_limit,
+            self.current().gas.remaining(),
+            self.gas_refund,
+            floor,
+        );
+        const unused = gas_limit - used;
+        try self.world.set_balance(sender, self.world.get_balance(sender) + @as(u256, unused) * fees.effective);
+        const tip = @as(u256, used) * fees.priority;
+        if (tip == 0) return;
+        try self.world.set_balance(self.env.coinbase, self.world.get_balance(self.env.coinbase) + tip);
     }
 
     fn reset_tx(self: *Vm) void {
@@ -255,10 +326,21 @@ pub const Vm = struct {
         self.last_return_len = 0;
         self.output_len = 0;
         self.accessed_count = 0;
+        self.accessed_slot_count = 0;
         self.log_count = 0;
         self.log_data_used = 0;
         self.steps = 0;
+        self.gas_refund = 0;
         self.world.transient_count = 0;
+        self.created_count = 0;
+        self.delete_count = 0;
+    }
+
+    fn run_or_fault(self: *Vm) void {
+        self.run() catch {
+            self.fault_current();
+            self.finish_top();
+        };
     }
 
     pub fn run(self: *Vm) !void {
@@ -267,7 +349,7 @@ pub const Vm = struct {
             const frame = self.current();
             if (frame.status != .running) {
                 if (self.frame_count == 1) {
-                    try self.finish_top();
+                    self.finish_top();
                     return;
                 }
                 try self.exit_child();
@@ -282,21 +364,30 @@ pub const Vm = struct {
         }
     }
 
-    fn finish_top(self: *Vm) !void {
+    fn finish_top(self: *Vm) void {
         const frame = self.current();
         if (frame.status == .stopped) self.output_len = 0;
-        if (frame.kind != .create) return;
         const success = frame.status == .returned or frame.status == .stopped;
         if (!success) {
-            self.world.rollback(frame.journal_mark);
+            self.rollback_frame(frame);
             return;
         }
+        if (frame.kind != .create) return;
         self.deposit_create_code(frame) catch {
             frame.status = .faulted;
             frame.gas.used = frame.gas.limit;
             self.output_len = 0;
-            self.world.rollback(frame.journal_mark);
+            self.rollback_frame(frame);
         };
+    }
+
+    fn rollback_frame(self: *Vm, frame: *const Frame) void {
+        self.world.rollback(frame.journal_mark);
+        self.gas_refund = frame.refund_mark;
+        self.log_count = frame.log_mark;
+        self.log_data_used = frame.log_data_mark;
+        self.created_count = frame.created_mark;
+        self.delete_count = frame.delete_mark;
     }
 
     pub fn current(self: *Vm) *Frame {
@@ -311,7 +402,7 @@ pub const Vm = struct {
             self.exec_cheatcode();
             return;
         }
-        if (precompile.is_precompile(frame.code_address)) {
+        if (precompile.is_precompile(frame.code_address) and !frame.disable_precompiles) {
             try self.exec_precompile();
             return;
         }
@@ -417,6 +508,7 @@ pub const Vm = struct {
             .staticcall => try self.exec_call(.staticcall),
             .create => try self.exec_create(false),
             .create2 => try self.exec_create(true),
+            .selfdestruct => try self.exec_selfdestruct(),
             .log0 => try self.exec_log(0),
             .log1 => try self.exec_log(1),
             .log2 => try self.exec_log(2),
@@ -429,16 +521,29 @@ pub const Vm = struct {
     fn exec_sload(self: *Vm) !u32 {
         const frame = self.current();
         const key = try frame.stack.pop();
+        try frame.gas.consume(try self.access_storage(frame.context.address, key));
         try frame.stack.push(self.world.load(frame.context.address, key));
         return frame.pc + 1;
     }
 
     fn exec_sstore(self: *Vm) !u32 {
         const frame = self.current();
-        if (frame.is_static) return error.WriteInStaticContext;
         const key = try frame.stack.pop();
-        const value = try frame.stack.pop();
-        try self.world.store(frame.context.address, key, value);
+        const new_value = try frame.stack.pop();
+        if (frame.gas.remaining() <= gas_mod.gas_call_stipend) return error.OutOfGas;
+        const addr = frame.context.address;
+        const cold = !self.is_storage_warm(addr, key);
+        try self.mark_storage_warm(addr, key);
+        const charge = gas_mod.sstore_gas(
+            self.storage_original(addr, key),
+            self.world.load(addr, key),
+            new_value,
+            cold,
+        );
+        try frame.gas.consume(charge.cost);
+        if (frame.is_static) return error.WriteInStaticContext;
+        try self.world.store(addr, key, new_value);
+        self.gas_refund += charge.refund_delta;
         return frame.pc + 1;
     }
 
@@ -456,6 +561,30 @@ pub const Vm = struct {
         const value = try frame.stack.pop();
         try self.world.tstore(frame.context.address, key, value);
         return frame.pc + 1;
+    }
+
+    fn exec_selfdestruct(self: *Vm) !u32 {
+        const frame = self.current();
+        const beneficiary = word.to_address(try frame.stack.pop());
+        var cost: u64 = gas_mod.gas_selfdestruct;
+        if (!self.is_warm(beneficiary)) {
+            try self.mark_warm(beneficiary);
+            cost += gas_mod.gas_cold_account;
+        }
+        const originator = frame.context.address;
+        const balance = self.world.get_balance(originator);
+        if (!self.world.is_alive(beneficiary) and balance != 0) {
+            cost += gas_mod.gas_selfdestruct_new_account;
+        }
+        try frame.gas.consume(cost);
+        if (frame.is_static) return error.WriteInStaticContext;
+        try self.world.move_ether(originator, beneficiary, balance);
+        if (self.is_created(originator)) {
+            if (beneficiary == originator) try self.world.set_balance(originator, 0);
+            try self.mark_deleted(originator);
+        }
+        frame.status = .stopped;
+        return @intCast(frame.code.len);
     }
 
     fn exec_balance(self: *Vm) !u32 {
@@ -528,16 +657,13 @@ pub const Vm = struct {
         const memory_cost = memory_gas_delta(old_size, frame.memory.size());
         try frame.gas.consume(memory_cost);
 
-        const code_address = switch (kind) {
-            .call, .staticcall => to,
-            .callcode, .delegatecall => to,
-        };
         const target = switch (kind) {
             .call, .staticcall => to,
             .callcode, .delegatecall => frame.context.address,
         };
-        const access_cost = try self.access_account(code_address);
-        var extra = access_cost;
+        var extra = try self.access_account(to);
+        const resolved = try self.resolve_delegation(to);
+        extra += resolved.extra;
         const transfer_value: u256 = switch (kind) {
             .delegatecall => frame.context.call_value,
             .staticcall => 0,
@@ -585,11 +711,11 @@ pub const Vm = struct {
             },
         }
         if (kind != .delegatecall) {
-            self.apply_prank(&child_context, code_address, frame.depth);
+            self.apply_prank(&child_context, to, frame.depth);
         }
         if (kind == .call or kind == .staticcall) {
             if (try self.try_mock(
-                code_address,
+                to,
                 transfer_value,
                 in_offset,
                 in_size,
@@ -600,14 +726,15 @@ pub const Vm = struct {
         }
         self.bump_pool(frame);
         try self.push_message(.{
-            .code = self.world.code_of(code_address),
+            .code = resolved.code,
             .calldata = frame.memory.bytes[in_offset .. in_offset + in_size],
             .gas_limit = call_gas.sub_call,
             .context = child_context,
             .depth = frame.depth + 1,
             .is_static = kind == .staticcall or frame.is_static,
             .kind = .call,
-            .code_address = code_address,
+            .code_address = resolved.address,
+            .disable_precompiles = resolved.disable_precompiles,
             .out_offset = out_offset,
             .out_size = out_size,
             .should_transfer = should_transfer,
@@ -849,6 +976,8 @@ pub const Vm = struct {
         const code = if (params.kind == .create) try self.copy_to_pool(params.code) else params.code;
         const mem_offset = self.memory_used;
         const journal_mark = self.world.mark();
+        const created_mark = self.created_count;
+        const delete_mark = self.delete_count;
         if (params.should_transfer and params.value != 0) {
             try self.world.touch(params.context.address);
             try self.world.move_ether(params.context.caller, params.context.address, params.value);
@@ -857,6 +986,7 @@ pub const Vm = struct {
         }
         if (params.kind == .create) {
             try self.world.set_nonce(params.context.address, 1);
+            try self.mark_created(params.context.address);
         }
         self.frames[self.frame_count] = .{
             .code = code,
@@ -871,12 +1001,16 @@ pub const Vm = struct {
             .is_static = params.is_static,
             .kind = params.kind,
             .code_address = params.code_address,
+            .disable_precompiles = params.disable_precompiles,
             .out_offset = params.out_offset,
             .out_size = params.out_size,
             .pool_mark = pool_mark,
             .journal_mark = journal_mark,
+            .refund_mark = self.gas_refund,
             .log_mark = self.log_count,
             .log_data_mark = self.log_data_used,
+            .created_mark = created_mark,
+            .delete_mark = delete_mark,
             .mem_offset = mem_offset,
         };
         self.frame_count += 1;
@@ -900,11 +1034,7 @@ pub const Vm = struct {
         const raw_ok = child.status == .returned or child.status == .stopped;
         var parent_ok = raw_ok;
         const fail_parent = self.consume_expect_revert(child, raw_ok, &parent_ok);
-        if (!raw_ok) {
-            self.world.rollback(child.journal_mark);
-            self.log_count = child.log_mark;
-            self.log_data_used = child.log_data_mark;
-        }
+        if (!raw_ok) self.rollback_frame(child);
         if (raw_ok or revert) {
             self.frames[self.frame_count - 2].gas.refund(child.gas.remaining());
         }
@@ -979,6 +1109,41 @@ pub const Vm = struct {
         return gas_mod.gas_cold_account;
     }
 
+    fn access_storage(self: *Vm, address: u256, key: u256) !u64 {
+        if (self.is_storage_warm(address, key)) return gas_mod.gas_warm_access;
+        try self.mark_storage_warm(address, key);
+        return gas_mod.gas_cold_sload;
+    }
+
+    fn is_storage_warm(self: *const Vm, address: u256, key: u256) bool {
+        var index: u32 = 0;
+        while (index < self.accessed_slot_count) : (index += 1) {
+            const slot = self.accessed_slots[index];
+            if (slot.address == address and slot.key == key) return true;
+        }
+        return false;
+    }
+
+    fn mark_storage_warm(self: *Vm, address: u256, key: u256) !void {
+        if (self.is_storage_warm(address, key)) return;
+        if (self.accessed_slot_count >= limits.accessed_storage_max) return error.AccessListFull;
+        self.accessed_slots[self.accessed_slot_count] = .{
+            .address = address,
+            .key = key,
+            .original = self.world.load(address, key),
+        };
+        self.accessed_slot_count += 1;
+    }
+
+    fn storage_original(self: *const Vm, address: u256, key: u256) u256 {
+        var index: u32 = 0;
+        while (index < self.accessed_slot_count) : (index += 1) {
+            const slot = self.accessed_slots[index];
+            if (slot.address == address and slot.key == key) return slot.original;
+        }
+        return self.world.load(address, key);
+    }
+
     fn is_warm(self: *const Vm, address: u256) bool {
         var index: u32 = 0;
         while (index < self.accessed_count) : (index += 1) {
@@ -1000,6 +1165,118 @@ pub const Vm = struct {
             try self.mark_warm(address);
         }
     }
+
+    fn warm_access_list(self: *Vm) !void {
+        for (self.access_list) |item| {
+            try self.mark_warm(item.address);
+            for (item.keys) |key| {
+                try self.mark_storage_warm(item.address, key);
+            }
+        }
+    }
+
+    fn access_list_gas(self: *const Vm) u64 {
+        var addresses: u64 = 0;
+        var keys: u64 = 0;
+        for (self.access_list) |item| {
+            addresses += 1;
+            keys += item.keys.len;
+        }
+        return gas_mod.access_list_gas(addresses, keys);
+    }
+
+    const ResolvedCode = struct {
+        address: u256,
+        code: []const u8,
+        extra: u64,
+        disable_precompiles: bool,
+    };
+
+    /// Top-level type-4 / call target: follow one designation, no extra gas.
+    fn follow_tx_delegation(self: *Vm, to: u256) !ResolvedCode {
+        const code = self.world.code_of(to);
+        const delegated = delegation.delegated_address(code) orelse
+            return .{ .address = to, .code = code, .extra = 0, .disable_precompiles = false };
+        try self.mark_warm(delegated);
+        return .{
+            .address = delegated,
+            .code = self.world.code_of(delegated),
+            .extra = 0,
+            .disable_precompiles = true,
+        };
+    }
+
+    /// CALL* resolution: follow one designation and charge warm/cold for it.
+    fn resolve_delegation(self: *Vm, address: u256) !ResolvedCode {
+        const code = self.world.code_of(address);
+        const delegated = delegation.delegated_address(code) orelse
+            return .{ .address = address, .code = code, .extra = 0, .disable_precompiles = false };
+        return .{
+            .address = delegated,
+            .code = self.world.code_of(delegated),
+            .extra = try self.access_account(delegated),
+            .disable_precompiles = true,
+        };
+    }
+
+    fn apply_authorizations(self: *Vm) !void {
+        std.debug.assert(self.authorizations.len <= limits.authorizations_max);
+        for (self.authorizations) |auth| {
+            try self.apply_one_authorization(auth);
+        }
+    }
+
+    fn apply_one_authorization(self: *Vm, auth: delegation.Authorization) !void {
+        if (auth.chain_id != 0 and auth.chain_id != self.env.chain_id) return;
+        if (auth.nonce == std.math.maxInt(u64)) return;
+        const authority = delegation.recover_authority(auth) orelse return;
+        try self.mark_warm(authority);
+        const code = self.world.code_of(authority);
+        if (code.len != 0 and !delegation.is_valid(code)) return;
+        if (self.world.get_nonce(authority) != auth.nonce) return;
+        if (self.world.get_account(authority) != null) {
+            self.gas_refund += @as(i64, gas_mod.gas_auth_per_empty - gas_mod.gas_auth_base);
+        }
+        if (auth.address == 0) {
+            try self.world.set_code(authority, &[_]u8{});
+        } else {
+            const des = delegation.designation(auth.address);
+            try self.world.set_code(authority, &des);
+        }
+        try self.world.increment_nonce(authority);
+    }
+
+    fn is_created(self: *const Vm, address: u256) bool {
+        var index: u32 = 0;
+        while (index < self.created_count) : (index += 1) {
+            if (self.created_this_tx[index] == address) return true;
+        }
+        return false;
+    }
+
+    fn mark_created(self: *Vm, address: u256) !void {
+        if (self.is_created(address)) return;
+        if (self.created_count >= limits.accounts_max) return error.AccountLimit;
+        self.created_this_tx[self.created_count] = address;
+        self.created_count += 1;
+    }
+
+    fn mark_deleted(self: *Vm, address: u256) !void {
+        var index: u32 = 0;
+        while (index < self.delete_count) : (index += 1) {
+            if (self.deleted[index] == address) return;
+        }
+        if (self.delete_count >= limits.accounts_max) return error.AccountLimit;
+        self.deleted[self.delete_count] = address;
+        self.delete_count += 1;
+    }
+
+    fn destroy_deleted(self: *Vm) !void {
+        var index: u32 = 0;
+        while (index < self.delete_count) : (index += 1) {
+            try self.world.destroy_account(self.deleted[index]);
+        }
+    }
 };
 
 const CallOpcode = enum { call, callcode, delegatecall, staticcall };
@@ -1013,6 +1290,7 @@ const MessageParams = struct {
     is_static: bool,
     kind: CallKind,
     code_address: u256,
+    disable_precompiles: bool = false,
     out_offset: u32,
     out_size: u32,
     should_transfer: bool,
@@ -1020,14 +1298,7 @@ const MessageParams = struct {
 };
 
 fn memory_gas_delta(old_size: u32, new_size: u32) u64 {
-    std.debug.assert(new_size >= old_size);
-    const old_words = (old_size + 31) / 32;
-    const new_words = (new_size + 31) / 32;
-    if (new_words <= old_words) return 0;
-    const delta_words = new_words - old_words;
-    const linear = @as(u64, delta_words) * 3;
-    const quadratic = (@as(u64, new_words) * @as(u64, new_words)) / 512;
-    return linear + quadratic;
+    return gas_mod.memory_expansion_gas(old_size, new_size);
 }
 
 fn init_code_gas(length: u32) u64 {
@@ -1176,13 +1447,16 @@ fn exec_mstore8(frame: *Frame) !u32 {
 }
 
 fn exec_mcopy(frame: *Frame) !u32 {
-    const dest = try word.to_u32(try frame.stack.pop());
-    const src = try word.to_u32(try frame.stack.pop());
-    const length = try word.to_u32(try frame.stack.pop());
-    try frame.gas.consume_copy(length);
+    const dest = try frame.stack.pop();
+    const src = try frame.stack.pop();
+    const length = try frame.stack.pop();
+    try frame.gas.consume(try gas_mod.copy_words_gas(length));
     const old_size = frame.memory.size();
-    try frame.memory.copy(dest, src, length);
-    try frame.gas.consume_memory(old_size, frame.memory.size());
+    const new_size = try memory_mod.expansion_end(old_size, dest, src, length);
+    try frame.gas.consume_memory(old_size, new_size);
+    if (new_size > frame.memory.bytes.len) return error.MemoryOverflow;
+    if (length == 0) return frame.pc + 1;
+    try frame.memory.copy(try word.to_u32(dest), try word.to_u32(src), try word.to_u32(length));
     return frame.pc + 1;
 }
 

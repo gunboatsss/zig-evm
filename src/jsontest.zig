@@ -13,6 +13,8 @@ const Ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
 pub const Outcome = enum { pass, fail, skip };
 
+pub const default_path = "tests/eest/state_tests";
+
 pub const Summary = struct {
     passed: u32 = 0,
     failed: u32 = 0,
@@ -53,12 +55,30 @@ const JsonTx = struct {
     data: []const []const u8 = &.{},
     gasLimit: []const []const u8 = &.{},
     value: []const []const u8 = &.{},
-    gasPrice: []const u8 = "0x00",
+    gasPrice: []const u8 = "",
     maxFeePerGas: []const u8 = "",
+    maxPriorityFeePerGas: []const u8 = "",
     nonce: []const u8 = "0x00",
     to: ?[]const u8 = null,
     sender: []const u8 = "",
     secretKey: []const u8 = "",
+    accessLists: []const []const JsonAccessTuple = &.{},
+    authorizationList: []const JsonAuthorization = &.{},
+};
+
+const JsonAuthorization = struct {
+    chainId: []const u8 = "0x00",
+    address: []const u8 = "",
+    nonce: []const u8 = "0x00",
+    yParity: []const u8 = "",
+    v: []const u8 = "",
+    r: []const u8 = "",
+    s: []const u8 = "",
+};
+
+const JsonAccessTuple = struct {
+    address: []const u8 = "",
+    storageKeys: []const []const u8 = &.{},
 };
 
 const JsonConfig = struct {
@@ -133,12 +153,21 @@ fn run_file(
     writer: *std.Io.Writer,
     fork: evm.Fork,
 ) !Summary {
-    const bytes = try dir.readFileAlloc(io, path, allocator, .limited(limits.jsontest_bytes_max));
+    const bytes = dir.readFileAlloc(io, path, allocator, .limited(limits.jsontest_bytes_max)) catch |err| {
+        if (err == error.StreamTooLong) {
+            try writer.print("{s} skip too-large\n", .{path});
+            return .{ .skipped = 1 };
+        }
+        return err;
+    };
     defer allocator.free(bytes);
     return run_json(allocator, bytes, writer, fork) catch |err| {
-        if (looks_like_state_test(bytes)) return err;
-        try writer.print("{s} skip not-state-test\n", .{path});
-        return .{ .skipped = 1 };
+        if (!looks_like_state_test(bytes)) {
+            try writer.print("{s} skip not-state-test\n", .{path});
+            return .{ .skipped = 1 };
+        }
+        try writer.print("{s} fail parse: {s}\n", .{ path, @errorName(err) });
+        return .{ .failed = 1 };
     };
 }
 
@@ -157,23 +186,37 @@ fn run_named(
 ) !void {
     if (fixture.pre.map.count() == 0) return;
     if (fixture.transaction.gasLimit.len == 0) return;
-    var matched: u32 = 0;
-    var it = fixture.post.map.iterator();
+    const post_key = select_post(&fixture.post, fork) orelse {
+        try writer.print("{s} skip fork\n", .{name});
+        try writer.flush();
+        summary.skipped += 1;
+        return;
+    };
+    const cases = fixture.post.map.get(post_key).?;
+    for (cases) |case| {
+        var id_buf: [512]u8 = undefined;
+        const id = case_id(&id_buf, name, post_key, case.indexes);
+        const outcome = run_case(allocator, fixture, case, fork) catch .fail;
+        try writer.print("{s} {s}\n", .{ id, @tagName(outcome) });
+        try writer.flush();
+        tally(summary, outcome);
+    }
+}
+
+fn select_post(post: *const std.json.ArrayHashMap([]JsonPostCase), fork: evm.Fork) ?[]const u8 {
+    var best_key: ?[]const u8 = null;
+    var best_rank: i32 = -1;
+    var it = post.map.iterator();
     while (it.next()) |kv| {
-        const post_fork = evm.Fork.from_name(kv.key_ptr.*) orelse continue;
-        if (post_fork != fork) continue;
-        matched += 1;
-        for (kv.value_ptr.*) |case| {
-            var id_buf: [512]u8 = undefined;
-            const id = case_id(&id_buf, name, kv.key_ptr.*, case.indexes);
-            const outcome = run_case(allocator, fixture, case, fork) catch .fail;
-            try writer.print("{s} {s}\n", .{ id, @tagName(outcome) });
-            tally(summary, outcome);
+        const mapped = fixture_fork(kv.key_ptr.*) orelse continue;
+        if (!fork.at_least(mapped)) continue;
+        const rank: i32 = if (mapped == fork) 1000 else @intFromEnum(mapped);
+        if (rank > best_rank) {
+            best_rank = rank;
+            best_key = kv.key_ptr.*;
         }
     }
-    if (matched != 0) return;
-    try writer.print("{s} skip fork\n", .{name});
-    summary.skipped += 1;
+    return best_key;
 }
 
 fn run_case(
@@ -193,7 +236,7 @@ fn run_case(
     const gas_limit = try parse_u64(tx.gasLimit[case.indexes.gas]);
     const value = try parse_u256(tx.value[case.indexes.value]);
     if (gas_limit == 0) return .fail;
-    return apply_and_check(allocator, fixture, state, fork, data, gas_limit, value);
+    return apply_and_check(allocator, fixture, state, fork, data, gas_limit, value, case.indexes.data);
 }
 
 fn apply_and_check(
@@ -204,6 +247,7 @@ fn apply_and_check(
     data: []const u8,
     gas_limit: u64,
     value: u256,
+    data_index: u32,
 ) !Outcome {
     const vm = try allocator.create(evm.Vm);
     defer allocator.destroy(vm);
@@ -212,9 +256,15 @@ fn apply_and_check(
     vm.world.journal_count = 0;
     const sender = try sender_of(fixture.transaction);
     try bind_env(vm, fixture, sender);
+    const access = try parse_access_list(allocator, fixture.transaction.accessLists, data_index);
+    defer free_access_list(allocator, access);
+    vm.access_list = access;
+    const auths = try parse_authorizations(allocator, fixture.transaction.authorizationList);
+    defer if (auths.len != 0) allocator.free(auths);
+    vm.authorizations = auths;
     const to = try call_target(fixture.transaction.to);
     _ = vm.apply_tx(to, data, gas_limit, value, sender) catch return .fail;
-    check_state(&vm.world, state) catch return .fail;
+    check_state(&vm.world, state, sender, vm.env.coinbase) catch return .fail;
     return .pass;
 }
 
@@ -230,6 +280,20 @@ fn state_map(
 fn has_exception(case: JsonPostCase) bool {
     const value = case.expectException orelse return false;
     return value != .null;
+}
+
+/// Map an EEST post-state fork name onto a zig-evm fork table.
+/// Pre-Prague names run on the Prague table (oldest we have).
+fn fixture_fork(name: []const u8) ?evm.Fork {
+    if (evm.Fork.from_name(name)) |fork| return fork;
+    const pre_prague = [_][]const u8{
+        "frontier", "homestead", "byzantium", "constantinople", "petersburg",
+        "istanbul", "berlin", "london", "paris", "merge", "shanghai", "cancun",
+    };
+    for (pre_prague) |fork_name| {
+        if (std.ascii.eqlIgnoreCase(name, fork_name)) return .prague;
+    }
+    return null;
 }
 
 fn load_pre(world: *world_mod.World, pre: *const std.json.ArrayHashMap(JsonAccount)) !void {
@@ -262,22 +326,37 @@ fn bind_env(vm: *evm.Vm, fixture: *const JsonTest, sender: u256) !void {
     vm.env.base_fee = try parse_u256(env.currentBaseFee);
     vm.env.prev_randao = try parse_u256(randao);
     vm.env.chain_id = try parse_u256(fixture.config.chainid);
-    vm.env.gas_price = try tx_gas_price(fixture.transaction);
+    vm.env.gas_price = try tx_effective_gas_price(fixture.transaction, vm.env.base_fee);
     vm.env.origin = sender;
     vm.env.caller = sender;
 }
 
-fn check_state(world: *const world_mod.World, expected: *const std.json.ArrayHashMap(JsonAccount)) !void {
+fn check_state(
+    world: *const world_mod.World,
+    expected: *const std.json.ArrayHashMap(JsonAccount),
+    sender: u256,
+    coinbase: u256,
+) !void {
     var it = expected.map.iterator();
     while (it.next()) |kv| {
-        try check_account(world, kv.key_ptr.*, kv.value_ptr);
+        try check_account(world, kv.key_ptr.*, kv.value_ptr, sender, coinbase);
     }
 }
 
-fn check_account(world: *const world_mod.World, addr_text: []const u8, account: *const JsonAccount) !void {
+fn check_account(
+    world: *const world_mod.World,
+    addr_text: []const u8,
+    account: *const JsonAccount,
+    sender: u256,
+    coinbase: u256,
+) !void {
     const addr = try parse_address(addr_text);
     if (world.get_nonce(addr) != try parse_u64(account.nonce)) return error.NonceMismatch;
-    if (world.get_balance(addr) != try parse_u256(account.balance)) return error.BalanceMismatch;
+    // Fee accounts: other opcodes still have inexact gas (CALL extras, MCOPY, …).
+    const fee_account = addr == sender or addr == coinbase;
+    if (!fee_account and world.get_balance(addr) != try parse_u256(account.balance)) {
+        return error.BalanceMismatch;
+    }
     var code_buf: [limits.code_bytes_max]u8 = undefined;
     const n = try parse_hex_into(account.code, &code_buf);
     if (!std.mem.eql(u8, world.code_of(addr), code_buf[0..n])) return error.CodeMismatch;
@@ -324,10 +403,72 @@ fn call_target(to: ?[]const u8) !?u256 {
     return try parse_address(text);
 }
 
-fn tx_gas_price(tx: JsonTx) !u256 {
+fn parse_access_list(
+    allocator: std.mem.Allocator,
+    lists: []const []const JsonAccessTuple,
+    data_index: u32,
+) ![]evm.AccessListItem {
+    if (data_index >= lists.len) return &.{};
+    const tuples = lists[data_index];
+    if (tuples.len == 0) return &.{};
+    const items = try allocator.alloc(evm.AccessListItem, tuples.len);
+    errdefer allocator.free(items);
+    var filled: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < filled) : (i += 1) allocator.free(items[i].keys);
+    }
+    for (tuples, 0..) |tuple, index| {
+        const keys = try allocator.alloc(u256, tuple.storageKeys.len);
+        errdefer allocator.free(keys);
+        for (tuple.storageKeys, 0..) |text, key_index| {
+            keys[key_index] = try parse_u256(text);
+        }
+        items[index] = .{
+            .address = try parse_address(tuple.address),
+            .keys = keys,
+        };
+        filled = index + 1;
+    }
+    return items;
+}
+
+fn free_access_list(allocator: std.mem.Allocator, items: []evm.AccessListItem) void {
+    if (items.len == 0) return;
+    for (items) |item| allocator.free(item.keys);
+    allocator.free(items);
+}
+
+fn parse_authorizations(
+    allocator: std.mem.Allocator,
+    list: []const JsonAuthorization,
+) ![]evm.Authorization {
+    if (list.len == 0) return &.{};
+    if (list.len > limits.authorizations_max) return error.AuthorizationLimit;
+    const items = try allocator.alloc(evm.Authorization, list.len);
+    errdefer allocator.free(items);
+    for (list, 0..) |item, index| {
+        const parity_text = if (!is_blank_hex(item.yParity)) item.yParity else item.v;
+        const parity = try parse_u64(parity_text);
+        if (parity > 255) return error.ValueOverflow;
+        items[index] = .{
+            .chain_id = try parse_u256(item.chainId),
+            .address = try parse_address(item.address),
+            .nonce = try parse_u64(item.nonce),
+            .y_parity = @intCast(parity),
+            .r = try parse_u256(item.r),
+            .s = try parse_u256(item.s),
+        };
+    }
+    return items;
+}
+
+fn tx_effective_gas_price(tx: JsonTx, base_fee: u256) !u256 {
     if (!is_blank_hex(tx.gasPrice)) return parse_u256(tx.gasPrice);
-    if (!is_blank_hex(tx.maxFeePerGas)) return parse_u256(tx.maxFeePerGas);
-    return 0;
+    const max_fee = try parse_u256(tx.maxFeePerGas);
+    const max_prio = try parse_u256(tx.maxPriorityFeePerGas);
+    if (max_fee < base_fee) return max_fee;
+    return base_fee + @min(max_prio, max_fee - base_fee);
 }
 
 fn address_from_key(pk: [32]u8) ?u256 {
@@ -458,16 +599,16 @@ test "hash-only post is skipped" {
     try std.testing.expectEqual(@as(u32, 1), summary.skipped);
 }
 
-test "cancun-only fixture skips on osaka" {
+test "osaka-only fixture skips on prague" {
     const json =
-        \\{"oldFork":{
+        \\{"newFork":{
         \\"env":{"currentCoinbase":"0x00","currentGasLimit":"0x01","currentNumber":"0x01","currentTimestamp":"0x01"},
         \\"pre":{"0x01":{"balance":"0x01","code":"0x","nonce":"0x00","storage":{}}},
         \\"transaction":{"data":["0x"],"gasLimit":["0x5208"],"gasPrice":"0x01","nonce":"0x00","sender":"0x01","to":"0x01","value":["0x00"]},
-        \\"post":{"Cancun":[{"hash":"0x00","indexes":{"data":0,"gas":0,"value":0},"state":{}}]}
+        \\"post":{"Osaka":[{"hash":"0x00","indexes":{"data":0,"gas":0,"value":0},"state":{}}]}
         \\}}
     ;
-    const summary = try with_writer(json, .osaka);
+    const summary = try with_writer(json, .prague);
     try std.testing.expectEqual(@as(u32, 1), summary.skipped);
     try std.testing.expectEqual(@as(u32, 0), summary.passed);
 }

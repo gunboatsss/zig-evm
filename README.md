@@ -17,6 +17,18 @@ zig build test
 ./zig-out/bin/zig-evm run 0x60016002016003019060045500
 ```
 
+## Execution spec tests
+
+Filled [ethereum/execution-spec-tests](https://github.com/ethereum/execution-spec-tests) state fixtures (v5.4.0, Osaka develop set):
+
+```bash
+scripts/fetch_eest_fixtures.sh          # smoke subset (PUSH0, TSTORE, MCOPY, CLZ)
+scripts/fetch_eest_fixtures.sh --all    # every state_test in the tarball
+zig build jsontest                      # or: zig-evm jsontest tests/eest/state_tests
+```
+
+Fixtures live in `tests/eest/` (gitignored). Cases with only a post state-root are skipped; `post.state` is compared account-by-account. Sender and coinbase balances are ignored until gas is charged. `zig build jsontest -Djsontest-path=path` runs a single file or directory.
+
 ## Architecture
 
 ```

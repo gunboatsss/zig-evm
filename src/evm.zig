@@ -6,12 +6,16 @@ const precompile = @import("precompile.zig");
 const cheatcode = @import("cheatcode.zig");
 const state_mod = @import("state.zig");
 const word = @import("u256.zig");
+const rlp = @import("rlp.zig");
+const delegation = @import("delegation.zig");
 
 pub const Frame = interpreter.Frame;
 pub const Status = interpreter.Status;
 pub const ExecutionContext = state_mod.ExecutionContext;
 pub const Fork = opcode_mod.Fork;
 pub const Vm = interpreter.Vm;
+pub const AccessListItem = interpreter.AccessListItem;
+pub const Authorization = interpreter.Authorization;
 
 pub const Result = struct {
     status: Status,
@@ -129,6 +133,76 @@ test "osaka mcopy" {
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
     try std.testing.expectEqual(@as(u8, 0x42), result.return_data()[0]);
+}
+
+test "mcopy length zero does not expand memory" {
+    // PUSH1 0 PUSH1 0 PUSH1 32 MCOPY MSIZE PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+    const code = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x20, 0x5e,
+        0x59, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.return_data()[31]);
+}
+
+test "mcopy huge dest zero length succeeds" {
+    var code: [38]u8 = undefined;
+    code[0] = 0x60;
+    code[1] = 0x00;
+    code[2] = 0x60;
+    code[3] = 0x00;
+    code[4] = 0x7f;
+    @memset(code[5..37], 0xff);
+    code[37] = 0x5e;
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "apply_tx access list adds intrinsic gas" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const keys = [_]u256{};
+    const items = [_]AccessListItem{.{ .address = 9, .keys = &keys }};
+    vm.access_list = &items;
+    try std.testing.expectError(error.IntrinsicGas, vm.apply_tx(3, &[_]u8{}, 23_399, 0, 1));
+    const status = try vm.apply_tx(3, &[_]u8{}, 23_400, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqual(@as(u256, 23_400), vm.world.get_balance(2));
+}
+
+test "selfdestruct pre-existing transfers and keeps code" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    var ctx = ExecutionContext.default();
+    ctx.address = 3;
+    try vm.init(&[_]u8{ 0x60, 0x04, 0xff }, &[_]u8{}, 1_000_000, ctx, .osaka);
+    try vm.world.set_balance(3, 1_000);
+    try vm.run();
+    try std.testing.expectEqual(Status.stopped, vm.current().status);
+    try std.testing.expectEqual(@as(u256, 0), vm.world.get_balance(3));
+    try std.testing.expectEqual(@as(u256, 1_000), vm.world.get_balance(4));
+    try std.testing.expectEqual(@as(usize, 3), vm.world.code_of(3).len);
+}
+
+test "create then selfdestruct deletes new account" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const init_code = [_]u8{ 0x60, 0x04, 0xff };
+    const status = try vm.apply_tx(null, &init_code, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    const created = rlp.create_address(1, 0);
+    try std.testing.expect(!vm.world.is_alive(created));
 }
 
 test "call empty account returns one" {
@@ -465,4 +539,175 @@ fn push20(out: []u8, who: u256) u32 {
     word.to_bytes_be(who, &addr);
     @memcpy(out[1..21], addr[12..32]);
     return 21;
+}
+
+test "apply_tx charges intrinsic gas" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const status = try vm.apply_tx(3, &[_]u8{}, 21_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqual(@as(u256, 979_000), vm.world.get_balance(1));
+    try std.testing.expectEqual(@as(u256, 21_000), vm.world.get_balance(2));
+    try std.testing.expectEqual(@as(u64, 1), vm.world.get_nonce(1));
+}
+
+test "sload cold then warm" {
+    // PUSH1 0 SLOAD POP PUSH1 0 SLOAD STOP
+    const code = [_]u8{ 0x60, 0x00, 0x54, 0x50, 0x60, 0x00, 0x54, 0x00 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+    try std.testing.expectEqual(@as(u64, 2_208), result.gas_used);
+}
+
+test "sstore cold set from zero" {
+    // PUSH1 1 PUSH1 0 SSTORE STOP
+    const code = [_]u8{ 0x60, 0x01, 0x60, 0x00, 0x55, 0x00 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+    try std.testing.expectEqual(@as(u64, 22_106), result.gas_used);
+}
+
+test "apply_tx refunds sstore clear" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    try vm.world.set_code(3, &[_]u8{ 0x60, 0x00, 0x60, 0x00, 0x55, 0x00 });
+    try vm.world.store(3, 0, 1);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqual(@as(u256, 0), vm.world.load(3, 0));
+    try std.testing.expectEqual(@as(u256, 978_794), vm.world.get_balance(1));
+    try std.testing.expectEqual(@as(u256, 21_206), vm.world.get_balance(2));
+}
+
+test "top-level revert undoes sstore" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    try vm.world.set_code(3, &[_]u8{ 0x60, 0x01, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xfd });
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.reverted, status);
+    try std.testing.expectEqual(@as(u256, 0), vm.world.load(3, 0));
+}
+
+fn clz_set_code_auth() Authorization {
+    return .{
+        .chain_id = 0,
+        .address = 0x3d8e2d77bca8c0ed68f6d4860444bad2cc2cd661,
+        .nonce = 0,
+        .y_parity = 1,
+        .r = 0xd7e81ad52b1ff78769c3b925b06176b76280242c83ebaf4cdb624820ab2b08db,
+        .s = 0x0367ba5e94031aac8cfb792d405da03d4a7874fb4f4cd37e653f56271e9522e6,
+    };
+}
+
+test "call follows eip-7702 designation" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const impl: u256 = 0xaaa;
+    const eoa: u256 = 0xbbb;
+    try vm.world.set_code(impl, &[_]u8{ 0x60, 0x01, 0x60, 0x00, 0x55, 0x00 });
+    const des = delegation.designation(impl);
+    try vm.world.set_code(eoa, &des);
+    var ctx = ExecutionContext.default();
+    ctx.caller = 1;
+    const status = try vm.apply_call(eoa, &[_]u8{}, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqual(@as(u256, 1), vm.world.load(eoa, 0));
+    try std.testing.expectEqual(@as(u256, 0), vm.world.load(impl, 0));
+}
+
+test "apply_tx processes authorization and executes delegated code" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const impl: u256 = 0x3d8e2d77bca8c0ed68f6d4860444bad2cc2cd661;
+    const authority: u256 = 0x89873a93c67fc34d662483a081ebaabe443ea62f;
+    try vm.world.set_code(impl, &[_]u8{
+        0x60, 0x01, 0x1e, 0x60, 0x00, 0x55,
+        0x60, 0x02, 0x1e, 0x60, 0x01, 0x55,
+        0x70, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x1e, 0x60, 0x02, 0x55, 0x00,
+    });
+    try vm.world.set_nonce(impl, 1);
+    try vm.world.set_balance(1, 10_000_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    vm.env.chain_id = 1;
+    const auths = [_]Authorization{clz_set_code_auth()};
+    vm.authorizations = &auths;
+    const status = try vm.apply_tx(authority, &[_]u8{}, 200_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqualSlices(u8, &delegation.designation(impl), vm.world.code_of(authority));
+    try std.testing.expectEqual(@as(u64, 1), vm.world.get_nonce(authority));
+    try std.testing.expectEqual(@as(u256, 0xff), vm.world.load(authority, 0));
+    try std.testing.expectEqual(@as(u256, 0xfe), vm.world.load(authority, 1));
+    try std.testing.expectEqual(@as(u256, 0x7f), vm.world.load(authority, 2));
+}
+
+test "authorization survives top-level revert" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const authority: u256 = 0x89873a93c67fc34d662483a081ebaabe443ea62f;
+    const impl: u256 = 0x3d8e2d77bca8c0ed68f6d4860444bad2cc2cd661;
+    try vm.world.set_code(3, &[_]u8{ 0x60, 0x00, 0x60, 0x00, 0xfd });
+    try vm.world.set_balance(1, 10_000_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    vm.env.chain_id = 1;
+    const auths = [_]Authorization{clz_set_code_auth()};
+    vm.authorizations = &auths;
+    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.reverted, status);
+    try std.testing.expectEqualSlices(u8, &delegation.designation(impl), vm.world.code_of(authority));
+    try std.testing.expectEqual(@as(u64, 1), vm.world.get_nonce(authority));
+}
+
+test "existing authority refunds auth base cost" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const authority: u256 = 0x89873a93c67fc34d662483a081ebaabe443ea62f;
+    try vm.world.set_balance(authority, 1);
+    try vm.world.set_balance(1, 10_000_000);
+    try vm.world.set_code(3, &[_]u8{0x00});
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    vm.env.chain_id = 1;
+    const auths = [_]Authorization{clz_set_code_auth()};
+    vm.authorizations = &auths;
+    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqual(@as(i64, 12_500), vm.gas_refund);
+}
+
+test "apply_tx authorization adds intrinsic gas" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const auths = [_]Authorization{clz_set_code_auth()};
+    vm.authorizations = &auths;
+    try std.testing.expectError(error.IntrinsicGas, vm.apply_tx(3, &[_]u8{}, 45_999, 0, 1));
 }

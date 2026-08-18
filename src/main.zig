@@ -29,15 +29,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "forge-test")) {
-        try forge_test_command(stdout, arena, init.io, args[2..]);
+        var heap: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = heap.deinit();
+        try forge_test_command(stdout, heap.allocator(), init.io, args[2..]);
         try stdout.flush();
         return;
     }
 
     if (std.mem.eql(u8, args[1], "jsontest")) {
-        try jsontest_command(stdout, arena, init.io, args[2..]);
+        // Arena `destroy` is a no-op; each case heap-allocates a ~100MB Vm.
+        var heap: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = heap.deinit();
+        const result = jsontest_command(stdout, heap.allocator(), init.io, args[2..]);
         try stdout.flush();
-        return;
+        return result;
     }
 
     if (std.mem.eql(u8, args[1], "test-bytecode")) {
@@ -55,19 +60,20 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\Usage:
         \\  {s} run [--fork prague|osaka|amsterdam] <hex-bytecode> [hex-calldata]
         \\  {s} forge-test [--fork prague|osaka|amsterdam] [out-dir]
-        \\  {s} jsontest [--fork prague|osaka|amsterdam] <file-or-dir>
+        \\  {s} jsontest [--fork prague|osaka|amsterdam] [file-or-dir]
         \\  {s} test-bytecode
         \\
         \\Default fork is osaka. `run` is a plain EVM (no hevm cheatcodes).
         \\`forge-test` enables Foundry cheatcodes at 0x7109… and runs `test*`
         \\functions from `forge build` artifacts (no fuzz or invariants).
-        \\`jsontest` runs GeneralStateTests / EEST state_test JSON. Cases with
-        \\only a post state-root are skipped (no MPT); `post.state` is compared.
+        \\`jsontest` runs EEST / GeneralStateTests JSON from
+        \\`tests/eest/state_tests` (fetch with scripts/fetch_eest_fixtures.sh).
+        \\Cases with only a post state-root are skipped (no MPT).
         \\
         \\Examples:
         \\  {s} run 0x60011e00
         \\  {s} forge-test out
-        \\  {s} jsontest tests/add11.json
+        \\  {s} jsontest
         \\
     , .{ program, program, program, program, program, program, program });
 }
@@ -129,8 +135,16 @@ fn jsontest_command(
         fork = evm.Fork.from_name(rest[1]) orelse return error.UnknownFork;
         rest = rest[2..];
     }
-    if (rest.len == 0) return error.MissingJsonTestPath;
-    const summary = try jsontest.run_path(allocator, io, rest[0], writer, fork);
+    const path = if (rest.len >= 1) rest[0] else jsontest.default_path;
+    const summary = jsontest.run_path(allocator, io, path, writer, fork) catch |err| {
+        if (rest.len == 0) {
+            try writer.print(
+                "missing {s}; run scripts/fetch_eest_fixtures.sh\n",
+                .{path},
+            );
+        }
+        return err;
+    };
     try writer.print("{d} passed, {d} failed, {d} skipped\n", .{
         summary.passed,
         summary.failed,

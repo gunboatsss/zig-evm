@@ -21,15 +21,18 @@ pub const log_topics_max: u32 = 4;
 pub const log_data_bytes_max: u32 = 32 * 1024;
 pub const logs_max: u32 = 1024;
 pub const log_data_pool_bytes_max: u32 = 256 * 1024;
-pub const accounts_max: u32 = 512;
+/// Sized for EIP-7702 `test_many_delegations` (thousands of new authorities).
+pub const accounts_max: u32 = 8_192;
 pub const storage_slots_max: u32 = 4096;
 pub const journal_entries_max: u32 = 65_536;
-pub const accessed_addresses_max: u32 = 1024;
+pub const accessed_addresses_max: u32 = 8_192;
 pub const accessed_storage_max: u32 = 4096;
+/// EIP-7702 authorization tuples on one type-4 transaction.
+pub const authorizations_max: u32 = 8_192;
 pub const jumpdest_table_max: u32 = 8192;
 pub const trace_steps_max: u32 = 10_000_000;
 pub const forge_artifact_bytes_max: u32 = 32 * 1024 * 1024;
-pub const jsontest_bytes_max: u32 = 32 * 1024 * 1024;
+pub const jsontest_bytes_max: u32 = 64 * 1024 * 1024;
 pub const forge_sig_bytes_max: u32 = 256;
 pub const cheat_mocks_max: u32 = 32;
 pub const cheat_mock_data_bytes_max: u32 = 16 * 1024;
@@ -46,7 +49,10 @@ comptime {
     std.debug.assert(code_bytes_max > 0);
     std.debug.assert(init_code_bytes_max == 49_152);
     std.debug.assert(accounts_max > 0);
+    std.debug.assert(authorizations_max <= accounts_max);
+    std.debug.assert(authorizations_max <= accessed_addresses_max);
     std.debug.assert(logs_max > 0);
     std.debug.assert(log_data_pool_bytes_max > 0);
     std.debug.assert(jsontest_bytes_max > 0);
+    std.debug.assert(authorizations_max > 0);
 }

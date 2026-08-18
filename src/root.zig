@@ -11,6 +11,7 @@ test {
     _ = @import("opcode.zig");
     _ = @import("world.zig");
     _ = @import("rlp.zig");
+    _ = @import("delegation.zig");
     _ = @import("precompile.zig");
     _ = @import("cheatcode.zig");
     _ = @import("interpreter.zig");

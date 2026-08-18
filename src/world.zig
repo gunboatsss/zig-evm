@@ -159,6 +159,19 @@ pub const World = struct {
         try self.set_balance(to, dest + value);
     }
 
+    pub fn destroy_account(self: *World, address: u256) !void {
+        try self.set_balance(address, 0);
+        try self.set_nonce(address, 0);
+        try self.set_code(address, &[_]u8{});
+        var index: u32 = 0;
+        while (index < self.slot_count) : (index += 1) {
+            const slot = self.slots[index];
+            if (slot.address == address and slot.value != 0) {
+                try self.store(address, slot.key, 0);
+            }
+        }
+    }
+
     pub fn load(self: *const World, address: u256, key: u256) u256 {
         return load_slot(&self.slots, self.slot_count, address, key);
     }
