@@ -1,0 +1,12 @@
+.{
+    .name = .zig_evm,
+    .version = "0.1.0",
+    .fingerprint = 0x4689707e2124ba51,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "src",
+        "docs",
+        "README.md",
+    },
+}

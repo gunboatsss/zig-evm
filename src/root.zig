@@ -1,0 +1,21 @@
+//! Test root: pull every module's inline tests into `zig build test`.
+
+const std = @import("std");
+
+test {
+    _ = @import("u256.zig");
+    _ = @import("stack.zig");
+    _ = @import("memory.zig");
+    _ = @import("gas.zig");
+    _ = @import("fork.zig");
+    _ = @import("opcode.zig");
+    _ = @import("world.zig");
+    _ = @import("rlp.zig");
+    _ = @import("precompile.zig");
+    _ = @import("cheatcode.zig");
+    _ = @import("interpreter.zig");
+    _ = @import("evm.zig");
+    _ = @import("forge_test.zig");
+    _ = @import("jsontest.zig");
+    std.testing.refAllDecls(@This());
+}

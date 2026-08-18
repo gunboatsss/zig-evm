@@ -1,0 +1,59 @@
+# zig-evm
+
+A statically allocated Ethereum Virtual Machine (EVM) written in [Zig](https://ziglang.org/), following [Tiger Style](docs/TIGER_STYLE.md) — the safety-first coding methodology from [TigerBeetle](https://tigerbeetle.com/).
+
+Design goals, in order:
+
+1. **Safety** — assertions everywhere, explicit limits, no heap allocation after init
+2. **Performance** — hot interpreter loop, batch-friendly memory layout
+3. **Developer experience** — small modules, snake_case, readable control flow
+
+## Quick start
+
+```bash
+zig build
+zig build test
+./zig-out/bin/zig-evm test-bytecode
+./zig-out/bin/zig-evm run 0x60016002016003019060045500
+```
+
+## Architecture
+
+```
+src/
+  limits.zig      # hard caps on every resource
+  u256.zig        # EVM wrapping rules on native u256
+  stack.zig       # 1024-word operand stack
+  memory.zig      # linear byte memory with 32-byte expansion
+  gas.zig         # gas metering
+  state.zig       # storage + execution context
+  opcode.zig      # Osaka + Amsterdam opcode table
+  fork.zig        # osaka baseline, amsterdam additive
+  world.zig       # accounts, storage, revert journal
+  rlp.zig         # CREATE / CREATE2 addresses
+  interpreter.zig # iterative call stack, depth cap 1024
+  evm.zig         # public execute() API
+  main.zig        # CLI
+```
+
+The interpreter is a loop over a bounded call stack. Nested calls never recurse in Zig — a child frame is pushed, the loop continues, and the parent resumes after `exit_child`.
+
+## Supported opcodes
+
+Opcode metadata follows [`ethereum/execution-specs`](https://github.com/ethereum/execution-specs). **Osaka** is the default (`CLZ`, plus Cancun ops `TLOAD`/`TSTORE`, `MCOPY`, `BLOBHASH`/`BLOBBASEFEE`). **Amsterdam** is opt-in (`--fork amsterdam`) and adds `SLOTNUM` and EIP-8024 `DUPN`/`SWAPN`/`EXCHANGE`. Prague remains selectable as an older fork.
+
+External calls (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`) run on an iterative stack of at most **1025 frames** (`depth + 1 > 1024` is rejected, matching [execution-specs](https://github.com/ethereum/execution-specs)). `LOG0`–`LOG4` and the `ecrecover` precompile (`0x01`) are implemented. Remaining precompiles and `SELFDESTRUCT` are not. `BLOBHASH` returns 0.
+
+## Tiger Style highlights
+
+- **Static allocation**: call frames, memory pool, accounts, and storage are fixed-size arrays in `limits.zig`
+- **Assertions**: pre/postconditions on stack depth, memory bounds, gas remaining
+- **Explicit types**: `u32` for sizes and offsets, `u64` for gas — no `usize` in hot paths
+- **70-line functions**: interpreter ops split into small helpers
+- **Pair assertions**: memory expand checks both caller offset and internal active size
+
+See [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) for the full style reference.
+
+## License
+
+MIT

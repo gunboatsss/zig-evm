@@ -1,0 +1,468 @@
+const std = @import("std");
+const interpreter = @import("interpreter.zig");
+const limits = @import("limits.zig");
+const opcode_mod = @import("opcode.zig");
+const precompile = @import("precompile.zig");
+const cheatcode = @import("cheatcode.zig");
+const state_mod = @import("state.zig");
+const word = @import("u256.zig");
+
+pub const Frame = interpreter.Frame;
+pub const Status = interpreter.Status;
+pub const ExecutionContext = state_mod.ExecutionContext;
+pub const Fork = opcode_mod.Fork;
+pub const Vm = interpreter.Vm;
+
+pub const Result = struct {
+    status: Status,
+    gas_used: u64,
+    return_buffer: [limits.returndata_bytes_max]u8,
+    return_len: u32,
+    log_count: u32,
+
+    pub fn return_data(self: *const Result) []const u8 {
+        return self.return_buffer[0..self.return_len];
+    }
+};
+
+pub fn execute(
+    allocator: std.mem.Allocator,
+    code: []const u8,
+    calldata: []const u8,
+    gas_limit: u64,
+    context: ExecutionContext,
+) !Result {
+    return execute_with_fork(allocator, code, calldata, gas_limit, context, Fork.default);
+}
+
+pub fn execute_with_fork(
+    allocator: std.mem.Allocator,
+    code: []const u8,
+    calldata: []const u8,
+    gas_limit: u64,
+    context: ExecutionContext,
+    fork: Fork,
+) !Result {
+    std.debug.assert(gas_limit > 0);
+    const vm = try allocator.create(Vm);
+    defer allocator.destroy(vm);
+    try vm.init(code, calldata, gas_limit, context, fork);
+    try vm.run();
+    var result = Result{
+        .status = vm.current().status,
+        .gas_used = vm.current().gas.used,
+        .return_buffer = undefined,
+        .return_len = vm.output_len,
+        .log_count = vm.log_count,
+    };
+    std.debug.assert(result.return_len <= limits.returndata_bytes_max);
+    @memcpy(
+        result.return_buffer[0..result.return_len],
+        vm.output_buffer[0..result.return_len],
+    );
+    return result;
+}
+
+test "interpreter add" {
+    const code = [_]u8{ 0x60, 0x02, 0x60, 0x03, 0x01, 0x00 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "interpreter return word" {
+    const code = [_]u8{ 0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(usize, 32), result.return_data().len);
+    try std.testing.expectEqual(@as(u8, 0x2a), result.return_data()[31]);
+}
+
+test "interpreter jump" {
+    const code = [_]u8{ 0x60, 0x03, 0x56, 0x5b, 0x60, 0x01, 0x00 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "prague rejects clz" {
+    const code = [_]u8{ 0x60, 0x01, 0x1e, 0x00 };
+    const result = execute_with_fork(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default(), .prague);
+    try std.testing.expectError(error.InvalidOpcode, result);
+}
+
+test "osaka clz" {
+    const code = [_]u8{ 0x60, 0x01, 0x1e, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0xff), result.return_data()[31]);
+}
+
+test "osaka rejects slotnum" {
+    const code = [_]u8{ 0x4b, 0x00 };
+    const result = execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectError(error.InvalidOpcode, result);
+}
+
+test "amsterdam slotnum" {
+    const code = [_]u8{ 0x4b, 0x00 };
+    const result = try execute_with_fork(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default(), .amsterdam);
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "osaka tstore tload" {
+    const code = [_]u8{
+        0x60, 0x07, 0x60, 0x00, 0x5d,
+        0x60, 0x00, 0x5c,
+        0x60, 0x00, 0x52,
+        0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0x07), result.return_data()[31]);
+}
+
+test "osaka mcopy" {
+    const code = [_]u8{
+        0x60, 0x42, 0x60, 0x00, 0x53,
+        0x60, 0x01, 0x60, 0x00, 0x60, 0x20, 0x5e,
+        0x60, 0x20, 0x60, 0x20, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0x42), result.return_data()[0]);
+}
+
+test "call empty account returns one" {
+    // CALL into address 2 (warm, no precompile, no code) and RETURN the success flag.
+    const code = [_]u8{
+        0x60, 0x00, // retSize
+        0x60, 0x00, // retOffset
+        0x60, 0x00, // argSize
+        0x60, 0x00, // argOffset
+        0x60, 0x00, // value
+        0x60, 0x02, // to
+        0x61, 0xff, 0xff, // gas
+        0xf1, // CALL
+        0x60, 0x00, 0x52, // MSTORE
+        0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN 32 bytes
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0x01), result.return_data()[31]);
+}
+
+test "self call stops at stack depth limit" {
+    // ADDRESS CALL STOP — each frame calls itself once. Depth 1024's CALL
+    // returns 0; every shallower CALL succeeds. Must not crash.
+    const code = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x30, // ADDRESS
+        0x5a, // GAS
+        0xf1, // CALL
+        0x00, // STOP
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 10_000_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "create deploys empty contract" {
+    // Init code PUSH1 0 PUSH1 0 RETURN at memory offset 27.
+    const code = [_]u8{
+        0x64, 0x60, 0x00, 0x60, 0x00, 0xf3,
+        0x60, 0x00, 0x52,
+        0x60, 0x05, // size 5
+        0x60, 0x1b, // offset 27
+        0x60, 0x00, // endowment
+        0xf0, // CREATE
+        0x15, // ISZERO
+        0x60, 0x00, 0x52,
+        0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    // ISZERO(address) == 0 means CREATE returned a non-zero address.
+    try std.testing.expectEqual(@as(u8, 0x00), result.return_data()[31]);
+}
+
+test "keccak256 empty" {
+    const code = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x20,
+        0x60, 0x00, 0x52,
+        0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0xc5), result.return_data()[0]);
+    try std.testing.expectEqual(@as(u8, 0x70), result.return_data()[31]);
+}
+
+test "log0 records one log" {
+    const code = [_]u8{
+        0x60, 0x61, 0x60, 0x00, 0x53, // MSTORE8 0x61 at 0
+        0x60, 0x01, 0x60, 0x00, 0xa0, // LOG0 size=1 offset=0
+        0x00,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+    try std.testing.expectEqual(@as(u32, 1), result.log_count);
+}
+
+test "ecrecover precompile recovers signer" {
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+    var seed: [Ecdsa.KeyPair.seed_length]u8 = undefined;
+    @memset(&seed, 0x42);
+    const kp = try Ecdsa.KeyPair.generateDeterministic(seed);
+    var hash: [32]u8 = undefined;
+    @memset(&hash, 0x11);
+    const sig = try kp.signPrehashed(hash, null);
+    const r = word.from_bytes_be(&sig.r);
+    const s = word.from_bytes_be(&sig.s);
+    const rec27 = precompile.ecrecover(hash, 27, r, s);
+    const rec28 = precompile.ecrecover(hash, 28, r, s);
+    const want = rec27 orelse rec28 orelse return error.TestUnexpectedResult;
+    const v: u8 = if (rec27 != null) 27 else 28;
+
+    const code = [_]u8{
+        0x60, 0x80, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY dest=0 off=0 size=128
+        0x60, 0x20, // retSize
+        0x60, 0x00, // retOffset
+        0x60, 0x80, // argSize
+        0x60, 0x00, // argOffset
+        0x60, 0x00, // value
+        0x60, 0x01, // to = ecrecover
+        0x61, 0xff, 0xff, // gas
+        0xf1, // CALL
+        0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN
+    };
+    var calldata: [128]u8 = undefined;
+    @memset(&calldata, 0);
+    @memcpy(calldata[0..32], &hash);
+    calldata[63] = v;
+    @memcpy(calldata[64..96], &sig.r);
+    @memcpy(calldata[96..128], &sig.s);
+    const result = try execute(std.testing.allocator, &code, &calldata, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqualSlices(u8, &want, result.return_data());
+}
+
+test "sha256 precompile empty hash" {
+    const code = [_]u8{
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x02, 0x61, 0xff, 0xff, 0xfa, // STATICCALL sha256
+        0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0xe3), result.return_data()[0]);
+    try std.testing.expectEqual(@as(u8, 0x55), result.return_data()[31]);
+}
+
+test "identity precompile copies calldata" {
+    const code = [_]u8{
+        0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY size=2
+        0x60, 0x02, 0x60, 0x00, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x04, 0x61, 0xff, 0xff, 0xf1, // CALL identity
+        0x60, 0x02, 0x60, 0x00, 0xf3,
+    };
+    const calldata = [_]u8{ 0xaa, 0xbb };
+    const result = try execute(std.testing.allocator, &code, &calldata, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqualSlices(u8, &calldata, result.return_data());
+}
+
+fn sel4(sig: []const u8) [4]u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(sig, &hash, .{});
+    return hash[0..4].*;
+}
+
+fn pack_word(value: u256, out: *[32]u8) void {
+    word.to_bytes_be(value, out);
+}
+
+test "cheatcode warp sets timestamp" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    try vm.init_session(.osaka);
+    var ctx = ExecutionContext.default();
+    ctx.caller = 1;
+    var data: [36]u8 = @splat(0);
+    @memcpy(data[0..4], &sel4("warp(uint256)"));
+    pack_word(12_345, data[4..36]);
+    const status = try vm.apply_call(cheatcode.address, &data, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, status);
+    try std.testing.expectEqual(@as(u256, 12_345), vm.env.timestamp);
+    try vm.world.set_code(0xaaa, &[_]u8{ 0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 });
+    const read = try vm.apply_call(0xaaa, &[_]u8{}, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, read);
+    try std.testing.expectEqual(@as(u256, 12_345), word.from_bytes_be(vm.output_buffer[0..32]));
+}
+
+test "cheatcode deal sets balance" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    try vm.init_session(.osaka);
+    var ctx = ExecutionContext.default();
+    ctx.caller = 1;
+    var data: [68]u8 = @splat(0);
+    @memcpy(data[0..4], &sel4("deal(address,uint256)"));
+    pack_word(0x42, data[4..36]);
+    pack_word(99, data[36..68]);
+    const status = try vm.apply_call(cheatcode.address, &data, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, status);
+    try std.testing.expectEqual(@as(u256, 99), vm.world.get_balance(0x42));
+}
+
+test "cheatcode prank sets next caller" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    try vm.init_session(.osaka);
+    try vm.world.set_code(0xbbb, &[_]u8{ 0x33, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 });
+    var caller_code: [96]u8 = undefined;
+    const n = encode_prank_then_call(&caller_code, 0xbbb);
+    try vm.world.set_code(0xaaa, caller_code[0..n]);
+    var ctx = ExecutionContext.default();
+    ctx.caller = 1;
+    ctx.origin = 1;
+    var data: [36]u8 = @splat(0);
+    @memcpy(data[0..4], &sel4("prank(address)"));
+    pack_word(0x11, data[4..36]);
+    const status = try vm.apply_call(0xaaa, &data, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, status);
+    try std.testing.expectEqual(@as(u256, 0x11), word.from_bytes_be(vm.output_buffer[0..32]));
+}
+
+test "cheatcode expectRevert swallows revert" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    try vm.init_session(.osaka);
+    try vm.world.set_code(0xccc, &[_]u8{ 0x60, 0x00, 0x60, 0x00, 0xfd });
+    var caller_code: [96]u8 = undefined;
+    const n = encode_expect_then_call(&caller_code, 0xccc);
+    try vm.world.set_code(0xaaa, caller_code[0..n]);
+    var ctx = ExecutionContext.default();
+    ctx.caller = 1;
+    var data: [4]u8 = sel4("expectRevert()");
+    const status = try vm.apply_call(0xaaa, &data, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, status);
+    try std.testing.expectEqual(@as(u8, 1), vm.output_buffer[31]);
+}
+
+test "extcodesize of hevm is nonzero" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    try vm.init_session(.osaka);
+    var code: [32]u8 = undefined;
+    code[0] = 0x73;
+    var addr: [32]u8 = undefined;
+    word.to_bytes_be(cheatcode.address, &addr);
+    @memcpy(code[1..21], addr[12..32]);
+    @memcpy(code[21..30], &[_]u8{ 0x3b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 });
+    try vm.world.set_code(0xaaa, code[0..30]);
+    var ctx = ExecutionContext.default();
+    ctx.caller = 1;
+    const status = try vm.apply_call(0xaaa, &[_]u8{}, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, status);
+    try std.testing.expectEqual(@as(u8, 1), vm.output_buffer[31]);
+}
+
+test "run path does not intercept hevm" {
+    const code = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x73, 0x71, 0x09, 0x70, 0x9e, 0xcf, 0xa9, 0x1a, 0x80, 0x62,
+        0x6f, 0xf3, 0x98, 0x9d, 0x68, 0xf6, 0x7f, 0x5b, 0x1d, 0xd1, 0x2d,
+        0x61, 0xff, 0xff, 0xf1, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 1), result.return_data()[31]);
+}
+
+fn encode_prank_then_call(out: []u8, target: u256) u32 {
+    return encode_vm_call_tail(out, target, true);
+}
+
+fn encode_expect_then_call(out: []u8, target: u256) u32 {
+    return encode_vm_call_tail(out, target, false);
+}
+
+fn encode_vm_call_tail(out: []u8, target: u256, return_data: bool) u32 {
+    var n: u32 = 0;
+    out[n] = 0x36;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x37;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x36;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    n += push20(out[n..], cheatcode.address);
+    out[n] = 0x5a;
+    n += 1;
+    out[n] = 0xf1;
+    n += 1;
+    out[n] = 0x50;
+    n += 1;
+    out[n] = 0x60;
+    n += 1;
+    out[n] = if (return_data) 0x20 else 0x00;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    out[n] = 0x5f;
+    n += 1;
+    n += push20(out[n..], target);
+    out[n] = 0x5a;
+    n += 1;
+    out[n] = 0xf1;
+    n += 1;
+    if (return_data) {
+        out[n] = 0x50;
+        n += 1;
+        out[n] = 0x60;
+        n += 1;
+        out[n] = 0x20;
+        n += 1;
+        out[n] = 0x5f;
+        n += 1;
+        out[n] = 0xf3;
+        n += 1;
+    } else {
+        out[n] = 0x60;
+        n += 1;
+        out[n] = 0x00;
+        n += 1;
+        out[n] = 0x52;
+        n += 1;
+        out[n] = 0x60;
+        n += 1;
+        out[n] = 0x20;
+        n += 1;
+        out[n] = 0x5f;
+        n += 1;
+        out[n] = 0xf3;
+        n += 1;
+    }
+    return n;
+}
+
+fn push20(out: []u8, who: u256) u32 {
+    out[0] = 0x73;
+    var addr: [32]u8 = undefined;
+    word.to_bytes_be(who, &addr);
+    @memcpy(out[1..21], addr[12..32]);
+    return 21;
+}
