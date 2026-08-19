@@ -9,9 +9,10 @@ pub const call_depth_limit: u32 = 1024;
 pub const call_frames_max: u32 = call_depth_limit + 1;
 
 pub const stack_depth_max: u32 = 1024;
-pub const memory_bytes_max: u32 = 1_048_576;
+/// Per-frame cap. Expansion past this is `MemoryOverflow` (then OutOfGas).
+pub const memory_bytes_max: u32 = 16 * 1024 * 1024;
 /// Shared bump pool for every frame's memory and calldata copies.
-pub const memory_pool_bytes_max: u32 = 64 * 1024 * 1024;
+pub const memory_pool_bytes_max: u32 = 128 * 1024 * 1024;
 pub const code_bytes_max: u32 = 24 * 1024;
 pub const init_code_bytes_max: u32 = 2 * code_bytes_max;
 /// Foundry test contracts often exceed EIP-170 / EIP-3860.
@@ -60,7 +61,8 @@ pub const cheat_snapshots_max: u32 = 16;
 pub const cheat_expect_bytes_max: u32 = 1024;
 /// Yellow Paper BLOCKHASH window.
 pub const block_hashes_max: u32 = 256;
-pub const header_rlp_bytes_max: u32 = 1024;
+pub const header_extra_bytes_max: u32 = 512;
+pub const header_rlp_bytes_max: u32 = 2048;
 pub const trie_nibble_max: u32 = 64;
 pub const trie_leaves_max: u32 = accounts_max + storage_slots_max;
 pub const trie_nodes_max: u32 = trie_leaves_max * 4;
@@ -102,7 +104,8 @@ comptime {
     std.debug.assert(forge_name_pool_bytes_max > 0);
     std.debug.assert(forge_code_pool_bytes_max > 0);
     std.debug.assert(block_hashes_max == 256);
-    std.debug.assert(header_rlp_bytes_max >= 512);
+    std.debug.assert(header_extra_bytes_max > 0);
+    std.debug.assert(header_rlp_bytes_max >= 512 + header_extra_bytes_max);
     std.debug.assert(trie_nibble_max == 64);
     std.debug.assert(trie_leaves_max >= accounts_max);
     std.debug.assert(trie_nodes_max >= trie_leaves_max);

@@ -24,5 +24,6 @@ test {
     _ = @import("evm.zig");
     _ = @import("forge_test.zig");
     _ = @import("jsontest.zig");
+    _ = @import("chaintest.zig");
     std.testing.refAllDecls(@This());
 }

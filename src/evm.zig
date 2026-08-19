@@ -16,6 +16,7 @@ pub const Fork = opcode_mod.Fork;
 pub const Vm = interpreter.Vm;
 pub const AccessListItem = interpreter.AccessListItem;
 pub const Authorization = interpreter.Authorization;
+pub const BlockTx = interpreter.BlockTx;
 
 pub const Result = struct {
     status: Status,
@@ -803,4 +804,63 @@ test "apply_tx authorization adds intrinsic gas" {
     const auths = [_]Authorization{clz_set_code_auth()};
     vm.authorizations = &auths;
     try std.testing.expectError(error.IntrinsicGas, vm.apply_tx(3, &[_]u8{}, 45_999, 0, 1));
+}
+
+test "apply_block runs a tx and BLOCKHASH sees the parent" {
+    const header_mod = @import("header.zig");
+    const trie_mod = @import("trie.zig");
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    try vm.world.set_code(3, &[_]u8{ 0x60, 0x00, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 });
+    vm.env.chain_id = 1;
+    const genesis = header_mod.Header{
+        .number = 0,
+        .gas_limit = 30_000_000,
+        .timestamp = 1,
+        .coinbase = 2,
+        .withdrawals_root = trie_mod.empty_root,
+    };
+    const genesis_hash = genesis.hash();
+    vm.push_block_hash(genesis_hash);
+    const block = header_mod.Header{
+        .parent_hash = genesis_hash,
+        .coinbase = 2,
+        .number = 1,
+        .gas_limit = 30_000_000,
+        .timestamp = 2,
+        .base_fee = 0,
+        .withdrawals_root = trie_mod.empty_root,
+    };
+    const txs = [_]BlockTx{.{
+        .to = 3,
+        .data = &.{},
+        .gas_limit = 100_000,
+        .value = 0,
+        .sender = 1,
+        .gas_price = 1,
+    }};
+    const gas_used = try vm.apply_block(block, &txs);
+    try std.testing.expect(gas_used >= 21_000);
+    try std.testing.expectEqual(@as(u32, 32), vm.output_len);
+    try std.testing.expectEqualSlices(u8, &genesis_hash, vm.output_buffer[0..32]);
+    vm.push_block_hash(block.hash());
+    try std.testing.expectEqual(@as(u32, 2), vm.block_hash_count);
+}
+
+test "push_block_hash keeps a 256-window" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    var i: u32 = 0;
+    while (i < 257) : (i += 1) {
+        var hash: [32]u8 = @splat(0);
+        hash[31] = @intCast(i & 0xff);
+        hash[30] = @intCast(i >> 8);
+        vm.push_block_hash(hash);
+    }
+    try std.testing.expectEqual(@as(u32, 256), vm.block_hash_count);
+    try std.testing.expectEqual(@as(u8, 1), vm.block_hashes[0][31]);
+    try std.testing.expectEqual(@as(u8, 0), vm.block_hashes[255][31]);
 }

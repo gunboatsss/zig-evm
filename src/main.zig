@@ -3,6 +3,7 @@ const evm = @import("evm.zig");
 const debug = @import("debug.zig");
 const forge_test = @import("forge_test.zig");
 const jsontest = @import("jsontest.zig");
+const chaintest = @import("chaintest.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -46,6 +47,14 @@ pub fn main(init: std.process.Init) !void {
         return result;
     }
 
+    if (std.mem.eql(u8, args[1], "chaintest")) {
+        var heap: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = heap.deinit();
+        const result = chaintest_command(stdout, heap.allocator(), init.io, args[2..]);
+        try stdout.flush();
+        return result;
+    }
+
     if (std.mem.eql(u8, args[1], "debug")) {
         var heap: std.heap.DebugAllocator(.{}) = .init;
         defer _ = heap.deinit();
@@ -72,6 +81,7 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\  {s} debug [--fork prague|osaka|amsterdam] --match-test <name> [--match-contract <name>] [out-dir] <cmd> [k=v...]
         \\  {s} forge-test [--fork prague|osaka|amsterdam] [out-dir]
         \\  {s} jsontest [--fork prague|osaka|amsterdam] [file-or-dir]
+        \\  {s} chaintest [--fork prague|osaka|amsterdam] [file-or-dir]
         \\  {s} test-bytecode
         \\
         \\Default fork is osaka. `run` is a plain EVM (no hevm cheatcodes).
@@ -85,6 +95,9 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\`tests/eest/state_tests` (fetch with scripts/fetch_eest_fixtures.sh).
         \\A 32-byte post.hash is the Merkle Patricia state root. EIP-6780 is
         \\included (Osaka SELFDESTRUCT); pre-Cancun posts for it are skipped.
+        \\`chaintest` runs EEST blockchain_tests (valid blocks: skip exceptions,
+        \\uncles, blobs, withdrawals). Fetch with
+        \\scripts/fetch_eest_fixtures.sh --blockchain.
         \\
         \\Examples:
         \\  {s} run 0x60011e00
@@ -93,10 +106,11 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\  {s} debug --match-test testFoo overview
         \\  {s} forge-test out
         \\  {s} jsontest
+        \\  {s} chaintest
         \\
     , .{
-        program, program, program, program, program, program,
-        program, program, program, program, program, program,
+        program, program, program, program, program, program, program,
+        program, program, program, program, program, program, program,
     });
 }
 
@@ -253,6 +267,36 @@ fn jsontest_command(
         summary.skipped,
     });
     if (summary.failed != 0) return error.JsonTestsFailed;
+}
+
+fn chaintest_command(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: []const [:0]const u8,
+) !void {
+    var rest = args;
+    var fork: evm.Fork = .osaka;
+    if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--fork")) {
+        fork = evm.Fork.from_name(rest[1]) orelse return error.UnknownFork;
+        rest = rest[2..];
+    }
+    const path = if (rest.len >= 1) rest[0] else chaintest.default_path;
+    const summary = chaintest.run_path(allocator, io, path, writer, fork) catch |err| {
+        if (rest.len == 0) {
+            try writer.print(
+                "missing {s}; run scripts/fetch_eest_fixtures.sh --blockchain\n",
+                .{path},
+            );
+        }
+        return err;
+    };
+    try writer.print("{d} passed, {d} failed, {d} skipped\n", .{
+        summary.passed,
+        summary.failed,
+        summary.skipped,
+    });
+    if (summary.failed != 0) return error.ChainTestsFailed;
 }
 
 fn test_bytecode_command(writer: *std.Io.Writer, allocator: std.mem.Allocator) !void {

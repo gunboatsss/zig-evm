@@ -38,4 +38,13 @@ pub fn build(b: *std.Build) void {
     }
     const jsontest_step = b.step("jsontest", "Run execution-spec state tests");
     jsontest_step.dependOn(&run_jsontest.step);
+
+    const run_chaintest = b.addRunArtifact(exe);
+    run_chaintest.setCwd(b.path("."));
+    run_chaintest.addArg("chaintest");
+    if (b.option([]const u8, "chaintest-path", "EEST blockchain JSON file or directory")) |path| {
+        run_chaintest.addArg(path);
+    }
+    const chaintest_step = b.step("chaintest", "Run execution-spec blockchain tests");
+    chaintest_step.dependOn(&run_chaintest.step);
 }

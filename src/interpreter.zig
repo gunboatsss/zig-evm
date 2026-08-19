@@ -75,6 +75,17 @@ pub const AccessListItem = struct {
 
 pub const Authorization = delegation.Authorization;
 
+pub const BlockTx = struct {
+    to: ?u256,
+    data: []const u8,
+    gas_limit: u64,
+    value: u256,
+    sender: u256,
+    gas_price: u256,
+    access_list: []const AccessListItem = &.{},
+    authorizations: []const Authorization = &.{},
+};
+
 pub const Vm = struct {
     world: world_mod.World,
     frames: [limits.call_frames_max]Frame,
@@ -107,6 +118,7 @@ pub const Vm = struct {
     delete_count: u32,
     block_hashes: [limits.block_hashes_max][32]u8,
     block_hash_count: u32,
+    tx_gas_used: u64,
     /// Null on the jsontest / forge-test path. Set only by `debug`.
     trace: ?*trace_mod.Trace,
 
@@ -326,6 +338,50 @@ pub const Vm = struct {
         return self.current().status;
     }
 
+    /// Run every transaction in a block. Caller sets `env.chain_id`. Gas is
+    /// the sum of settled tx gas; the BLOCKHASH window is not updated here.
+    pub fn apply_block(self: *Vm, header: header_mod.Header, txs: []const BlockTx) !u64 {
+        self.bind_block(header);
+        var gas_used: u64 = 0;
+        for (txs) |tx| {
+            try self.apply_block_tx(tx);
+            const next = @addWithOverflow(gas_used, self.tx_gas_used);
+            if (next[1] == 1) return error.BlockGasOverflow;
+            gas_used = next[0];
+        }
+        return gas_used;
+    }
+
+    pub fn push_block_hash(self: *Vm, hash: [32]u8) void {
+        if (self.block_hash_count < limits.block_hashes_max) {
+            self.block_hashes[self.block_hash_count] = hash;
+            self.block_hash_count += 1;
+            return;
+        }
+        var i: u32 = 0;
+        while (i + 1 < limits.block_hashes_max) : (i += 1) {
+            self.block_hashes[i] = self.block_hashes[i + 1];
+        }
+        self.block_hashes[limits.block_hashes_max - 1] = hash;
+    }
+
+    fn bind_block(self: *Vm, header: header_mod.Header) void {
+        self.env.coinbase = header.coinbase;
+        self.env.number = header.number;
+        self.env.timestamp = header.timestamp;
+        self.env.gas_limit = header.gas_limit;
+        self.env.base_fee = header.base_fee;
+        self.env.prev_randao = word.from_bytes_be(&header.prev_randao);
+    }
+
+    fn apply_block_tx(self: *Vm, tx: BlockTx) !void {
+        if (tx.gas_limit == 0) return error.IntrinsicGas;
+        self.access_list = tx.access_list;
+        self.authorizations = tx.authorizations;
+        self.env.gas_price = tx.gas_price;
+        _ = try self.apply_tx(tx.to, tx.data, tx.gas_limit, tx.value, tx.sender);
+    }
+
     fn settle_gas(self: *Vm, sender: u256, gas_limit: u64, fees: gas_mod.TxFees, floor: u64) !void {
         std.debug.assert(self.frame_count >= 1);
         const used = gas_mod.settled_gas_used(
@@ -334,6 +390,7 @@ pub const Vm = struct {
             self.gas_refund,
             floor,
         );
+        self.tx_gas_used = used;
         const unused = gas_limit - used;
         try self.world.set_balance(sender, self.world.get_balance(sender) + @as(u256, unused) * fees.effective);
         const tip = @as(u256, used) * fees.priority;
@@ -355,6 +412,7 @@ pub const Vm = struct {
         self.world.transient_count = 0;
         self.created_count = 0;
         self.delete_count = 0;
+        self.tx_gas_used = 0;
     }
 
     fn run_or_fault(self: *Vm) void {

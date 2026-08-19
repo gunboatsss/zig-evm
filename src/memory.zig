@@ -138,3 +138,12 @@ test "expansion end zero length stays current" {
     try std.testing.expectEqual(@as(u32, 0), try expansion_end(0, 32, 0, 0));
     try std.testing.expectEqual(@as(u32, 0), try expansion_end(0, std.math.maxInt(u256), 0, 0));
 }
+
+test "expand past 1 MiB succeeds within the frame cap" {
+    const cap: u32 = 2 * 1024 * 1024;
+    const buf = try std.testing.allocator.alloc(u8, cap);
+    defer std.testing.allocator.free(buf);
+    var memory = Memory.init(buf);
+    try memory.expand(cap - 32, 32);
+    try std.testing.expectEqual(cap, memory.size());
+}
