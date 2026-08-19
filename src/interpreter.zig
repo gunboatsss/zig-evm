@@ -86,6 +86,14 @@ pub const BlockTx = struct {
     authorizations: []const Authorization = &.{},
 };
 
+/// EIP-4788 / EIP-2935 / EIP-7002 / EIP-7251 system caller.
+const system_address: u256 = 0xfffffffffffffffffffffffffffffffffffffffe;
+const beacon_roots_address: u256 = 0x000F3dF6D732807EF1319Fb7B8BB8522d0BEAC02;
+const history_storage_address: u256 = 0x0000F90827F1C53a10cb7A02335B175320002935;
+const withdrawal_request_address: u256 = 0x00000961Ef480Eb55e80D19ad83579A64c007002;
+const consolidation_request_address: u256 = 0x0000BBddc7CE488642fb579F8B00f3A590007251;
+const system_tx_gas: u64 = 30_000_000;
+
 pub const Vm = struct {
     world: world_mod.World,
     frames: [limits.call_frames_max]Frame,
@@ -342,6 +350,7 @@ pub const Vm = struct {
     /// the sum of settled tx gas; the BLOCKHASH window is not updated here.
     pub fn apply_block(self: *Vm, header: header_mod.Header, txs: []const BlockTx) !u64 {
         self.bind_block(header);
+        try self.apply_block_system_pre(header);
         var gas_used: u64 = 0;
         for (txs) |tx| {
             try self.apply_block_tx(tx);
@@ -349,6 +358,7 @@ pub const Vm = struct {
             if (next[1] == 1) return error.BlockGasOverflow;
             gas_used = next[0];
         }
+        try self.apply_block_system_post();
         return gas_used;
     }
 
@@ -380,6 +390,33 @@ pub const Vm = struct {
         self.authorizations = tx.authorizations;
         self.env.gas_price = tx.gas_price;
         _ = try self.apply_tx(tx.to, tx.data, tx.gas_limit, tx.value, tx.sender);
+    }
+
+    fn apply_block_system_pre(self: *Vm, header: header_mod.Header) !void {
+        try self.system_call(beacon_roots_address, &header.parent_beacon_root);
+        try self.system_call(history_storage_address, &header.parent_hash);
+    }
+
+    fn apply_block_system_post(self: *Vm) !void {
+        try self.system_call(withdrawal_request_address, &[_]u8{});
+        try self.system_call(consolidation_request_address, &[_]u8{});
+    }
+
+    fn system_call(self: *Vm, to: u256, data: []const u8) !void {
+        if (self.world.code_of(to).len == 0) return;
+        const saved_list = self.access_list;
+        const saved_auth = self.authorizations;
+        self.access_list = &.{};
+        self.authorizations = &.{};
+        defer {
+            self.access_list = saved_list;
+            self.authorizations = saved_auth;
+        }
+        var ctx = self.env;
+        ctx.caller = system_address;
+        ctx.origin = system_address;
+        ctx.call_value = 0;
+        _ = self.apply_message(to, data, system_tx_gas, 0, ctx) catch {};
     }
 
     fn settle_gas(self: *Vm, sender: u256, gas_limit: u64, fees: gas_mod.TxFees, floor: u64) !void {

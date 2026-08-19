@@ -63,7 +63,8 @@ pub const Trie = struct {
             const acc_len = encode_account(&account_blob, account.nonce, account.balance, storage, code_hash);
             var addr_be: [32]u8 = undefined;
             word.to_bytes_be(account.address, &addr_be);
-            rlp.keccak(&addr_be, &state_keys[state_n]);
+            // Yellow Paper: state keys are keccak256 of the 20-byte address.
+            rlp.keccak(addr_be[12..32], &state_keys[state_n]);
             const off = try self.copy_value(account_blob[0..acc_len]);
             state_vals[state_n] = .{ .off = off, .len = acc_len };
             state_n += 1;

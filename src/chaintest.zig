@@ -218,7 +218,12 @@ fn run_named(
         summary.skipped += 1;
         return;
     }
-    const outcome = run_case(allocator, fixture, fork) catch .fail;
+    const outcome = run_case(allocator, fixture, fork) catch |err| {
+        try writer.print("{s} fail {s}\n", .{ name, @errorName(err) });
+        try writer.flush();
+        summary.failed += 1;
+        return;
+    };
     try writer.print("{s} {s}\n", .{ name, @tagName(outcome) });
     try writer.flush();
     tally(summary, outcome);
