@@ -12,8 +12,8 @@ spec tests) and `build.zig`.
 - Requires **Zig `0.16.0`** exactly. The code uses the post-"Writergate" APIs
   (`pub fn main(init: std.process.Init)`, `std.Io.File.stdout().writer(...)`),
   which do **not** compile on Zig 0.15 or earlier, and the master 0.17-dev API
-  has since drifted. The startup/update script installs `0.16.0` to `/opt/zig`
-  and symlinks it to `/usr/local/bin/zig`; `zig version` should print `0.16.0`.
+  has since drifted. Repo-managed Cloud Agents get Zig from `.cursor/Dockerfile`;
+  `zig version` should print `0.16.0`.
 - `build.zig.zon` declares no external dependencies, so there is nothing to
   `zig fetch` — a checkout plus the Zig toolchain is a complete dev setup.
 
