@@ -2,6 +2,7 @@
 //! Cheatcodes at the hevm address are supported. No fuzz or invariants.
 
 const std = @import("std");
+const artifact = @import("artifact.zig");
 const evm = @import("evm.zig");
 const limits = @import("limits.zig");
 
@@ -165,11 +166,13 @@ pub fn run_case(
     setup: ?[4]u8,
     failed: ?[4]u8,
     fork: evm.Fork,
+    artifacts: ?*const artifact.Store,
 ) !Outcome {
     if (case.kind == .fuzz) return .skip;
     const vm = try allocator.create(evm.Vm);
     defer allocator.destroy(vm);
     vm.init_session(fork) catch return .fail;
+    vm.cheats.artifacts = artifacts;
     try vm.world.set_balance(default_sender, default_balance);
     var ctx = evm.ExecutionContext.default();
     ctx.caller = default_sender;
@@ -214,6 +217,88 @@ fn is_nonzero(data: []const u8) bool {
     return false;
 }
 
+pub const MatchedTest = struct {
+    suite: Suite,
+    case_index: u32,
+    contract: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn case(self: *const MatchedTest) Case {
+        return self.suite.cases[self.case_index];
+    }
+
+    pub fn deinit(self: *MatchedTest) void {
+        self.allocator.free(self.contract);
+        self.suite.deinit(self.allocator);
+    }
+};
+
+/// Unique `test*` function whose name contains `test_filter`.
+/// `contract_filter` empty matches any artifact basename.
+pub fn match_test(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    test_filter: []const u8,
+    contract_filter: []const u8,
+) !MatchedTest {
+    std.debug.assert(test_filter.len > 0);
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    var found: ?MatchedTest = null;
+    errdefer if (found) |*m| m.deinit();
+    var match_count: u32 = 0;
+    while (try walker.next(io)) |entry| {
+        if (!artifact.is_artifact_file(entry)) continue;
+        const bytes = try entry.dir.readFileAlloc(
+            io,
+            entry.basename,
+            allocator,
+            .limited(limits.forge_artifact_bytes_max),
+        );
+        defer allocator.free(bytes);
+        const suite = (try parse_artifact(allocator, bytes)) orelse continue;
+        const contract = strip_json_suffix(entry.basename);
+        if (contract_filter.len != 0 and std.mem.indexOf(u8, contract, contract_filter) == null) {
+            suite.deinit(allocator);
+            continue;
+        }
+        var local: u32 = 0;
+        var local_index: u32 = 0;
+        for (suite.cases, 0..) |case, i| {
+            if (std.mem.indexOf(u8, case.name, test_filter) == null) continue;
+            local += 1;
+            local_index = @intCast(i);
+        }
+        if (local == 0) {
+            suite.deinit(allocator);
+            continue;
+        }
+        match_count += local;
+        if (match_count > 1) {
+            suite.deinit(allocator);
+            return error.AmbiguousTest;
+        }
+        const name = allocator.dupe(u8, contract) catch |err| {
+            suite.deinit(allocator);
+            return err;
+        };
+        found = .{
+            .suite = suite,
+            .case_index = local_index,
+            .contract = name,
+            .allocator = allocator,
+        };
+    }
+    var matched = found orelse return error.NoMatchingTest;
+    found = null;
+    errdefer matched.deinit();
+    if (matched.case().kind == .fuzz) return error.FuzzTest;
+    return matched;
+}
+
 pub fn run_dir(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -221,24 +306,20 @@ pub fn run_dir(
     writer: *std.Io.Writer,
     fork: evm.Fork,
 ) !Summary {
+    const store = try allocator.create(artifact.Store);
+    defer allocator.destroy(store);
+    store.init();
+    try store.load(allocator, io, dir_path);
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
     var walker = try dir.walk(allocator);
     defer walker.deinit();
     var summary = Summary{};
     while (try walker.next(io)) |entry| {
-        if (!is_artifact_file(entry)) continue;
-        try run_artifact_file(allocator, io, entry, writer, fork, &summary);
+        if (!artifact.is_artifact_file(entry)) continue;
+        try run_artifact_file(allocator, io, entry, writer, fork, store, &summary);
     }
     return summary;
-}
-
-fn is_artifact_file(entry: std.Io.Dir.Walker.Entry) bool {
-    if (entry.kind != .file) return false;
-    if (!std.mem.endsWith(u8, entry.basename, ".json")) return false;
-    if (std.mem.endsWith(u8, entry.basename, ".dbg.json")) return false;
-    if (std.mem.indexOf(u8, entry.path, "build-info") != null) return false;
-    return true;
 }
 
 fn run_artifact_file(
@@ -247,6 +328,7 @@ fn run_artifact_file(
     entry: std.Io.Dir.Walker.Entry,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    artifacts: *const artifact.Store,
     summary: *Summary,
 ) !void {
     const bytes = try entry.dir.readFileAlloc(
@@ -260,8 +342,17 @@ fn run_artifact_file(
     defer suite.deinit(allocator);
     const contract = strip_json_suffix(entry.basename);
     for (suite.cases) |case| {
-        const outcome = try run_case(allocator, suite.bytecode, case, suite.setup, suite.failed, fork);
+        const outcome = try run_case(
+            allocator,
+            suite.bytecode,
+            case,
+            suite.setup,
+            suite.failed,
+            fork,
+            artifacts,
+        );
         try writer.print("{s}:{s} {s}\n", .{ contract, case.name, @tagName(outcome) });
+        try writer.flush();
         tally(summary, outcome);
     }
 }
@@ -293,7 +384,7 @@ fn parse_hex(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return out;
 }
 
-fn wrap_runtime(runtime: []const u8, out: []u8) []const u8 {
+pub fn wrap_runtime(runtime: []const u8, out: []u8) []const u8 {
     std.debug.assert(runtime.len <= 255);
     std.debug.assert(out.len >= 12 + runtime.len);
     const off: u8 = 12;
@@ -331,7 +422,7 @@ test "run passing STOP test" {
     var buf: [16]u8 = undefined;
     const init_code = wrap_runtime(&runtime, &buf);
     const case = Case{ .name = "testOk", .selector = selector_of("testOk()"), .kind = .unit };
-    const outcome = try run_case(std.testing.allocator, init_code, case, null, null, .osaka);
+    const outcome = try run_case(std.testing.allocator, init_code, case, null, null, .osaka, null);
     try std.testing.expectEqual(Outcome.pass, outcome);
 }
 
@@ -340,7 +431,7 @@ test "run reverting test fails" {
     var buf: [20]u8 = undefined;
     const init_code = wrap_runtime(&runtime, &buf);
     const case = Case{ .name = "testOk", .selector = selector_of("testOk()"), .kind = .unit };
-    const outcome = try run_case(std.testing.allocator, init_code, case, null, null, .osaka);
+    const outcome = try run_case(std.testing.allocator, init_code, case, null, null, .osaka, null);
     try std.testing.expectEqual(Outcome.fail, outcome);
 }
 
@@ -349,7 +440,7 @@ test "testFail passes on revert" {
     var buf: [20]u8 = undefined;
     const init_code = wrap_runtime(&runtime, &buf);
     const case = Case{ .name = "testFailBoom", .selector = selector_of("testFailBoom()"), .kind = .test_fail };
-    const outcome = try run_case(std.testing.allocator, init_code, case, null, null, .osaka);
+    const outcome = try run_case(std.testing.allocator, init_code, case, null, null, .osaka, null);
     try std.testing.expectEqual(Outcome.pass, outcome);
 }
 
@@ -365,12 +456,13 @@ test "failed flag fails the test" {
         null,
         selector_of("failed()"),
         .osaka,
+        null,
     );
     try std.testing.expectEqual(Outcome.fail, outcome);
 }
 
 test "fuzz cases are skipped" {
     const case = Case{ .name = "testFuzz", .selector = selector_of("testFuzz(uint256)"), .kind = .fuzz };
-    const outcome = try run_case(std.testing.allocator, &[_]u8{0x00}, case, null, null, .osaka);
+    const outcome = try run_case(std.testing.allocator, &[_]u8{0x00}, case, null, null, .osaka, null);
     try std.testing.expectEqual(Outcome.skip, outcome);
 }

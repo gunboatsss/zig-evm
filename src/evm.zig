@@ -73,6 +73,29 @@ test "interpreter add" {
     try std.testing.expectEqual(Status.stopped, result.status);
 }
 
+test "interpreter gt is top greater than second" {
+    const code = [_]u8{ 0x60, 0x02, 0x60, 0x03, 0x11, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 1), result.return_data()[31]);
+}
+
+test "interpreter exp is top to the power of second" {
+    // PUSH1 2 PUSH1 10 EXP → 10**2
+    const code = [_]u8{ 0x60, 0x02, 0x60, 0x0a, 0x0a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 100), result.return_data()[31]);
+}
+
+test "interpreter addmod is (top + second) mod third" {
+    // PUSH1 5 PUSH1 4 PUSH1 3 ADDMOD → (3+4)%5
+    const code = [_]u8{ 0x60, 0x05, 0x60, 0x04, 0x60, 0x03, 0x08, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 2), result.return_data()[31]);
+}
+
 test "interpreter return word" {
     const code = [_]u8{ 0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());

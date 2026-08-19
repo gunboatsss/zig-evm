@@ -131,7 +131,7 @@ pub const World = struct {
     }
 
     pub fn set_code(self: *World, address: u256, code: []const u8) !void {
-        std.debug.assert(code.len <= limits.code_bytes_max);
+        std.debug.assert(code.len <= limits.forge_code_bytes_max);
         const index = try self.ensure_account(address);
         try self.push_journal(.{
             .op = .code,
@@ -257,6 +257,40 @@ pub const World = struct {
         return index;
     }
 
+    pub const SlotDiff = struct {
+        address: u256,
+        key: u256,
+        before: u256,
+        after: u256,
+        transient: bool,
+    };
+
+    /// First journal write supplies `before`; `after` is the live slot value.
+    pub fn collect_slot_diffs(self: *const World, out: []SlotDiff) u32 {
+        var n: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.journal_count) : (i += 1) {
+            const entry = self.journal[i];
+            if (entry.op != .storage and entry.op != .transient) continue;
+            const transient = entry.op == .transient;
+            if (find_diff(out[0..n], entry.address, entry.key, transient) != null) continue;
+            if (n >= out.len) break;
+            const after = if (transient)
+                self.tload(entry.address, entry.key)
+            else
+                self.load(entry.address, entry.key);
+            out[n] = .{
+                .address = entry.address,
+                .key = entry.key,
+                .before = entry.prev_u256,
+                .after = after,
+                .transient = transient,
+            };
+            n += 1;
+        }
+        return n;
+    }
+
     fn push_journal(self: *World, entry: JournalEntry) !void {
         if (self.journal_count >= limits.journal_entries_max) return error.JournalFull;
         self.journal[self.journal_count] = entry;
@@ -289,6 +323,16 @@ pub const World = struct {
     }
 };
 
+fn find_diff(diffs: []const World.SlotDiff, address: u256, key: u256, transient: bool) ?u32 {
+    var index: u32 = 0;
+    while (index < diffs.len) : (index += 1) {
+        if (diffs[index].address == address and diffs[index].key == key and diffs[index].transient == transient) {
+            return index;
+        }
+    }
+    return null;
+}
+
 fn undo_slot(slots: *[limits.storage_slots_max]StorageSlot, count: *u32, entry: JournalEntry) void {
     var index: u32 = 0;
     while (index < count.*) : (index += 1) {
@@ -309,6 +353,11 @@ test "world store load rollback" {
     try std.testing.expectEqual(@as(u256, 99), world.load(1, 7));
     world.rollback(snap);
     try std.testing.expectEqual(@as(u256, 42), world.load(1, 7));
+    var diffs: [8]World.SlotDiff = undefined;
+    const n = world.collect_slot_diffs(&diffs);
+    try std.testing.expectEqual(@as(u32, 1), n);
+    try std.testing.expectEqual(@as(u256, 0), diffs[0].before);
+    try std.testing.expectEqual(@as(u256, 42), diffs[0].after);
 }
 
 test "world ether move" {

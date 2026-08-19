@@ -14,7 +14,10 @@ test {
     _ = @import("delegation.zig");
     _ = @import("precompile.zig");
     _ = @import("cheatcode.zig");
+    _ = @import("artifact.zig");
     _ = @import("interpreter.zig");
+    _ = @import("trace.zig");
+    _ = @import("debug.zig");
     _ = @import("evm.zig");
     _ = @import("forge_test.zig");
     _ = @import("jsontest.zig");

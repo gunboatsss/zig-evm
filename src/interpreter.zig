@@ -11,6 +11,7 @@ const stack_mod = @import("stack.zig");
 const state_mod = @import("state.zig");
 const word = @import("u256.zig");
 const world_mod = @import("world.zig");
+const trace_mod = @import("trace.zig");
 
 pub const Status = enum {
     running,
@@ -102,6 +103,8 @@ pub const Vm = struct {
     created_count: u32,
     deleted: [limits.accounts_max]u256,
     delete_count: u32,
+    /// Null on the jsontest / forge-test path. Set only by `debug`.
+    trace: ?*trace_mod.Trace,
 
     pub fn init(
         self: *Vm,
@@ -133,6 +136,7 @@ pub const Vm = struct {
         self.authorizations = &.{};
         self.created_count = 0;
         self.delete_count = 0;
+        self.trace = null;
         try self.world.set_code(context.address, code);
         self.world.journal_count = 0;
         try self.warm_precompiles();
@@ -171,6 +175,7 @@ pub const Vm = struct {
         self.cheats_enabled = false;
         self.access_list = &.{};
         self.authorizations = &.{};
+        self.trace = null;
         self.reset_tx();
     }
 
@@ -181,7 +186,7 @@ pub const Vm = struct {
         value: u256,
         context: state_mod.ExecutionContext,
     ) !u256 {
-        std.debug.assert(init_code.len <= limits.init_code_bytes_max);
+        if (init_code.len > self.init_code_limit()) return 0;
         self.reset_tx();
         try self.warm_precompiles();
         try self.warm_access_list();
@@ -357,6 +362,13 @@ pub const Vm = struct {
             }
             if (self.steps >= limits.trace_steps_max) return error.StepLimitExceeded;
             self.steps += 1;
+            if (self.trace) |tr| {
+                self.record_trace(tr);
+                if (tr.stop_at != 0 and tr.step_count == tr.stop_at) {
+                    tr.paused = true;
+                    return;
+                }
+            }
             self.step() catch |err| {
                 if (self.frame_count == 1) return err;
                 self.fault_current();
@@ -365,6 +377,7 @@ pub const Vm = struct {
     }
 
     fn finish_top(self: *Vm) void {
+        if (self.trace) |tr| tr.close_call(self.frame_count - 1);
         const frame = self.current();
         if (frame.status == .stopped) self.output_len = 0;
         const success = frame.status == .returned or frame.status == .stopped;
@@ -399,7 +412,7 @@ pub const Vm = struct {
     fn step(self: *Vm) !void {
         const frame = self.current();
         if (self.cheats_enabled and cheatcode.is_cheatcode(frame.code_address)) {
-            self.exec_cheatcode();
+            try self.exec_cheatcode();
             return;
         }
         if (precompile.is_precompile(frame.code_address) and !frame.disable_precompiles) {
@@ -448,7 +461,7 @@ pub const Vm = struct {
             .or_ => try exec_wrapping(frame, bit_or),
             .xor => try exec_wrapping(frame, bit_xor),
             .not_ => try exec_not(frame),
-            .byte => try exec_wrapping(frame, word.byte),
+            .byte => try exec_byte(frame),
             .shl => try exec_shift(frame, word.shl),
             .shr => try exec_shift(frame, word.shr),
             .sar => try exec_shift(frame, word.sar),
@@ -880,7 +893,7 @@ pub const Vm = struct {
         frame.status = .returned;
     }
 
-    fn exec_cheatcode(self: *Vm) void {
+    fn exec_cheatcode(self: *Vm) !void {
         const frame = self.current();
         std.debug.assert(cheatcode.is_cheatcode(frame.code_address));
         const parent_depth: u32 = if (self.frame_count >= 2)
@@ -897,12 +910,69 @@ pub const Vm = struct {
             self.log_count,
             self.log_data_used,
         );
-        self.output_len = result.len;
         if (result.restore_logs) {
             self.log_count = result.log_count;
             self.log_data_used = result.log_data_used;
         }
+        if (result.spawn_create) {
+            if (frame.is_static or !self.spawn_cheat_create()) {
+                frame.status = .reverted;
+                self.output_len = 0;
+                return;
+            }
+            return;
+        }
+        self.output_len = result.len;
         frame.status = if (result.revert) .reverted else .returned;
+    }
+
+    /// CREATE from the contract that called the cheatcode (`new Foo()`), not hevm.
+    fn spawn_cheat_create(self: *Vm) bool {
+        std.debug.assert(self.frame_count >= 2);
+        const frame = self.current();
+        const sender = self.frames[self.frame_count - 2].context.address;
+        const init_code = self.cheats.init_code[0..self.cheats.init_code_len];
+        const endowment = self.cheats.create_value;
+        if (init_code.len > limits.init_code_bytes_max) return false;
+        const nonce = self.world.get_nonce(sender);
+        if (self.world.get_balance(sender) < endowment or nonce == std.math.maxInt(u64)) return false;
+        if (frame.depth + 1 > limits.call_depth_limit) return false;
+        const contract = if (self.cheats.use_create2)
+            rlp.create2_address(sender, self.cheats.create_salt, init_code)
+        else
+            rlp.create_address(sender, nonce);
+        self.mark_warm(contract) catch return false;
+        if (self.world.get_nonce(contract) != 0 or self.world.code_of(contract).len != 0) {
+            self.world.increment_nonce(sender) catch return false;
+            return false;
+        }
+        self.world.increment_nonce(sender) catch return false;
+        const create_gas = gas_mod.max_message_call_gas(frame.gas.remaining());
+        frame.gas.consume(create_gas) catch return false;
+        var child_context = frame.context;
+        child_context.address = contract;
+        child_context.caller = sender;
+        child_context.call_value = endowment;
+        self.bump_pool(frame);
+        self.cheats.deploy_pending = true;
+        self.push_message(.{
+            .code = init_code,
+            .calldata = &[_]u8{},
+            .gas_limit = create_gas,
+            .context = child_context,
+            .depth = frame.depth + 1,
+            .is_static = false,
+            .kind = .create,
+            .code_address = contract,
+            .out_offset = 0,
+            .out_size = 0,
+            .should_transfer = true,
+            .value = endowment,
+        }) catch {
+            self.cheats.deploy_pending = false;
+            return false;
+        };
+        return true;
     }
 
     fn apply_prank(self: *Vm, ctx: *state_mod.ExecutionContext, dest: u256, depth: u32) void {
@@ -1016,6 +1086,21 @@ pub const Vm = struct {
         self.frame_count += 1;
         std.debug.assert(self.frame_count <= limits.call_frames_max);
         std.debug.assert(params.depth <= limits.call_depth_limit);
+        if (self.trace) |tr| {
+            const parent = if (self.frame_count >= 2)
+                tr.call_of_frame(self.frame_count - 2)
+            else
+                trace_mod.no_parent;
+            tr.open_call(
+                self.frame_count - 1,
+                parent,
+                params.depth,
+                params.context.address,
+                params.code_address,
+                params.kind == .create,
+                params.gas_limit,
+            );
+        }
     }
 
     fn exit_child(self: *Vm) !void {
@@ -1038,9 +1123,17 @@ pub const Vm = struct {
         if (raw_ok or revert) {
             self.frames[self.frame_count - 2].gas.refund(child.gas.remaining());
         }
+        const parent = &self.frames[self.frame_count - 2];
+        if (self.cheats.deploy_pending and cheatcode.is_cheatcode(parent.code_address)) {
+            self.finish_cheat_create(parent, child, parent_ok);
+            if (fail_parent) parent.status = .reverted;
+            if (self.trace) |tr| tr.close_call(self.frame_count - 1);
+            self.memory_used = child.pool_mark;
+            self.frame_count -= 1;
+            return;
+        }
         @memcpy(self.last_return[0..self.output_len], self.output_buffer[0..self.output_len]);
         self.last_return_len = self.output_len;
-        const parent = &self.frames[self.frame_count - 2];
         if (child.kind == .call) {
             const copy_len = @min(child.out_size, self.last_return_len);
             if (copy_len > 0) {
@@ -1060,14 +1153,31 @@ pub const Vm = struct {
             try parent.stack.push(0);
         }
         if (fail_parent) parent.status = .reverted;
+        if (self.trace) |tr| tr.close_call(self.frame_count - 1);
         self.memory_used = child.pool_mark;
         self.frame_count -= 1;
         self.output_len = 0;
     }
 
+    fn finish_cheat_create(self: *Vm, parent: *Frame, child: *const Frame, parent_ok: bool) void {
+        self.cheats.deploy_pending = false;
+        if (parent_ok) {
+            word.to_bytes_be(child.context.address, self.output_buffer[0..32]);
+            self.output_len = 32;
+            parent.status = .returned;
+        } else {
+            self.output_len = 0;
+            parent.status = .reverted;
+        }
+        if (self.output_len > 0) {
+            @memcpy(self.last_return[0..self.output_len], self.output_buffer[0..self.output_len]);
+        }
+        self.last_return_len = self.output_len;
+    }
+
     fn deposit_create_code(self: *Vm, child: *Frame) !void {
         const code = self.output_buffer[0..self.output_len];
-        if (self.output_len > limits.code_bytes_max or (code.len > 0 and code[0] == 0xef)) {
+        if (self.output_len > self.code_limit() or (code.len > 0 and code[0] == 0xef)) {
             return error.InvalidCode;
         }
         const deposit = @as(u64, self.output_len) * gas_mod.gas_code_deposit;
@@ -1075,9 +1185,30 @@ pub const Vm = struct {
         try self.world.set_code(child.context.address, code);
     }
 
+    fn code_limit(self: *const Vm) u32 {
+        return if (self.cheats_enabled) limits.forge_code_bytes_max else limits.code_bytes_max;
+    }
+
+    fn init_code_limit(self: *const Vm) u32 {
+        return if (self.cheats_enabled) limits.forge_init_code_bytes_max else limits.init_code_bytes_max;
+    }
+
     fn bump_pool(self: *Vm, frame: *Frame) void {
         const end = frame.mem_offset + frame.memory.active_bytes;
         if (end > self.memory_used) self.memory_used = end;
+    }
+
+    fn record_trace(self: *Vm, tr: *trace_mod.Trace) void {
+        const frame = self.current();
+        const op_byte: u8 = if (frame.pc < frame.code.len) frame.code[frame.pc] else 0;
+        tr.record_step(.{
+            .pc = frame.pc,
+            .opcode = op_byte,
+            .gas_remaining = frame.gas.remaining(),
+            .depth = frame.depth,
+            .stack_depth = frame.stack.depth,
+            .call_index = tr.call_of_frame(self.frame_count - 1),
+        });
     }
 
     fn fault_current(self: *Vm) void {
@@ -1333,8 +1464,8 @@ fn exec_swap(frame: *Frame, opcode: opcode_mod.Opcode) !u32 {
 }
 
 fn exec_wrapping(frame: *Frame, op: *const fn (u256, u256) u256) !u32 {
-    const b = try frame.stack.pop();
     const a = try frame.stack.pop();
+    const b = try frame.stack.pop();
     try frame.stack.push(op(a, b));
     return frame.pc + 1;
 }
@@ -1347,24 +1478,24 @@ fn exec_shift(frame: *Frame, op: *const fn (u256, u256) u256) !u32 {
 }
 
 fn exec_addmod(frame: *Frame) !u32 {
-    const modulus = try frame.stack.pop();
-    const b = try frame.stack.pop();
     const a = try frame.stack.pop();
+    const b = try frame.stack.pop();
+    const modulus = try frame.stack.pop();
     try frame.stack.push(word.addmod(a, b, modulus));
     return frame.pc + 1;
 }
 
 fn exec_mulmod(frame: *Frame) !u32 {
-    const modulus = try frame.stack.pop();
-    const b = try frame.stack.pop();
     const a = try frame.stack.pop();
+    const b = try frame.stack.pop();
+    const modulus = try frame.stack.pop();
     try frame.stack.push(word.mulmod(a, b, modulus));
     return frame.pc + 1;
 }
 
 fn exec_exp(frame: *Frame) !u32 {
-    const exponent = try frame.stack.pop();
     const base = try frame.stack.pop();
+    const exponent = try frame.stack.pop();
     const exp_bytes = word.exponent_byte_size(exponent);
     if (exp_bytes > 0) try frame.gas.consume((exp_bytes - 1) * 50);
     try frame.stack.push(word.exp(base, exponent));
@@ -1378,16 +1509,23 @@ fn exec_signextend(frame: *Frame) !u32 {
     return frame.pc + 1;
 }
 
+fn exec_byte(frame: *Frame) !u32 {
+    const index = try frame.stack.pop();
+    const value = try frame.stack.pop();
+    try frame.stack.push(word.byte(value, index));
+    return frame.pc + 1;
+}
+
 fn exec_cmp(frame: *Frame, cmp: *const fn (u256, u256) bool) !u32 {
-    const b = try frame.stack.pop();
     const a = try frame.stack.pop();
+    const b = try frame.stack.pop();
     try frame.stack.push(if (cmp(a, b)) 1 else 0);
     return frame.pc + 1;
 }
 
 fn exec_sgt(frame: *Frame) !u32 {
-    const b = try frame.stack.pop();
     const a = try frame.stack.pop();
+    const b = try frame.stack.pop();
     try frame.stack.push(if (word.slt(b, a)) 1 else 0);
     return frame.pc + 1;
 }

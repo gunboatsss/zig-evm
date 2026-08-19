@@ -178,6 +178,106 @@ pub const Opcode = enum(u8) {
         return fork.at_least(introduced_in(opcode));
     }
 
+    /// Yellow Paper mnemonic for a bytecode byte, including PUSH/DUP/SWAP families.
+    pub fn mnemonic(byte: u8) []const u8 {
+        if (byte >= 0x60 and byte <= 0x7f) return push_mnemonics[byte - 0x60];
+        if (byte >= 0x80 and byte <= 0x8f) return dup_mnemonics[byte - 0x80];
+        if (byte >= 0x90 and byte <= 0x9f) return swap_mnemonics[byte - 0x90];
+        return switch (byte) {
+            0x00 => "STOP",
+            0x01 => "ADD",
+            0x02 => "MUL",
+            0x03 => "SUB",
+            0x04 => "DIV",
+            0x05 => "SDIV",
+            0x06 => "MOD",
+            0x07 => "SMOD",
+            0x08 => "ADDMOD",
+            0x09 => "MULMOD",
+            0x0a => "EXP",
+            0x0b => "SIGNEXTEND",
+            0x10 => "LT",
+            0x11 => "GT",
+            0x12 => "SLT",
+            0x13 => "SGT",
+            0x14 => "EQ",
+            0x15 => "ISZERO",
+            0x16 => "AND",
+            0x17 => "OR",
+            0x18 => "XOR",
+            0x19 => "NOT",
+            0x1a => "BYTE",
+            0x1b => "SHL",
+            0x1c => "SHR",
+            0x1d => "SAR",
+            0x1e => "CLZ",
+            0x20 => "KECCAK256",
+            0x30 => "ADDRESS",
+            0x31 => "BALANCE",
+            0x32 => "ORIGIN",
+            0x33 => "CALLER",
+            0x34 => "CALLVALUE",
+            0x35 => "CALLDATALOAD",
+            0x36 => "CALLDATASIZE",
+            0x37 => "CALLDATACOPY",
+            0x38 => "CODESIZE",
+            0x39 => "CODECOPY",
+            0x3a => "GASPRICE",
+            0x3b => "EXTCODESIZE",
+            0x3c => "EXTCODECOPY",
+            0x3d => "RETURNDATASIZE",
+            0x3e => "RETURNDATACOPY",
+            0x3f => "EXTCODEHASH",
+            0x40 => "BLOCKHASH",
+            0x41 => "COINBASE",
+            0x42 => "TIMESTAMP",
+            0x43 => "NUMBER",
+            0x44 => "PREVRANDAO",
+            0x45 => "GASLIMIT",
+            0x46 => "CHAINID",
+            0x47 => "SELFBALANCE",
+            0x48 => "BASEFEE",
+            0x49 => "BLOBHASH",
+            0x4a => "BLOBBASEFEE",
+            0x4b => "SLOTNUM",
+            0x50 => "POP",
+            0x51 => "MLOAD",
+            0x52 => "MSTORE",
+            0x53 => "MSTORE8",
+            0x54 => "SLOAD",
+            0x55 => "SSTORE",
+            0x56 => "JUMP",
+            0x57 => "JUMPI",
+            0x58 => "PC",
+            0x59 => "MSIZE",
+            0x5a => "GAS",
+            0x5b => "JUMPDEST",
+            0x5c => "TLOAD",
+            0x5d => "TSTORE",
+            0x5e => "MCOPY",
+            0x5f => "PUSH0",
+            0xa0 => "LOG0",
+            0xa1 => "LOG1",
+            0xa2 => "LOG2",
+            0xa3 => "LOG3",
+            0xa4 => "LOG4",
+            0xe6 => "DUPN",
+            0xe7 => "SWAPN",
+            0xe8 => "EXCHANGE",
+            0xf0 => "CREATE",
+            0xf1 => "CALL",
+            0xf2 => "CALLCODE",
+            0xf3 => "RETURN",
+            0xf4 => "DELEGATECALL",
+            0xf5 => "CREATE2",
+            0xfa => "STATICCALL",
+            0xfd => "REVERT",
+            0xfe => "INVALID",
+            0xff => "SELFDESTRUCT",
+            else => "INVALID",
+        };
+    }
+
     /// Static (base) gas only. Dynamic costs are charged in the interpreter.
     pub fn static_gas(opcode: Opcode) u64 {
         const raw: u8 = @intFromEnum(opcode);
@@ -244,6 +344,23 @@ pub fn exchange_immediate_valid(x: u8) bool {
     return x <= 81 or x >= 128;
 }
 
+const push_mnemonics = [_][]const u8{
+    "PUSH1",  "PUSH2",  "PUSH3",  "PUSH4",  "PUSH5",  "PUSH6",  "PUSH7",  "PUSH8",
+    "PUSH9",  "PUSH10", "PUSH11", "PUSH12", "PUSH13", "PUSH14", "PUSH15", "PUSH16",
+    "PUSH17", "PUSH18", "PUSH19", "PUSH20", "PUSH21", "PUSH22", "PUSH23", "PUSH24",
+    "PUSH25", "PUSH26", "PUSH27", "PUSH28", "PUSH29", "PUSH30", "PUSH31", "PUSH32",
+};
+
+const dup_mnemonics = [_][]const u8{
+    "DUP1", "DUP2",  "DUP3",  "DUP4",  "DUP5",  "DUP6",  "DUP7",  "DUP8",
+    "DUP9", "DUP10", "DUP11", "DUP12", "DUP13", "DUP14", "DUP15", "DUP16",
+};
+
+const swap_mnemonics = [_][]const u8{
+    "SWAP1", "SWAP2",  "SWAP3",  "SWAP4",  "SWAP5",  "SWAP6",  "SWAP7",  "SWAP8",
+    "SWAP9", "SWAP10", "SWAP11", "SWAP12", "SWAP13", "SWAP14", "SWAP15", "SWAP16",
+};
+
 test "push width" {
     try std.testing.expectEqual(@as(u32, 1), Opcode.push_width(.push1));
     try std.testing.expectEqual(@as(u32, 32), Opcode.push_width(.push32));
@@ -262,6 +379,17 @@ test "eip-8024 decode_pair of zero" {
 
 test "jumpdest gas is 1" {
     try std.testing.expectEqual(@as(u64, 1), Opcode.static_gas(.jumpdest));
+}
+
+test "mnemonic covers families and named ops" {
+    try std.testing.expectEqualStrings("STOP", Opcode.mnemonic(0x00));
+    try std.testing.expectEqualStrings("ADD", Opcode.mnemonic(0x01));
+    try std.testing.expectEqualStrings("PUSH1", Opcode.mnemonic(0x60));
+    try std.testing.expectEqualStrings("PUSH32", Opcode.mnemonic(0x7f));
+    try std.testing.expectEqualStrings("DUP1", Opcode.mnemonic(0x80));
+    try std.testing.expectEqualStrings("SWAP16", Opcode.mnemonic(0x9f));
+    try std.testing.expectEqualStrings("CLZ", Opcode.mnemonic(0x1e));
+    try std.testing.expectEqualStrings("INVALID", Opcode.mnemonic(0x0c));
 }
 
 test "clz is osaka, slotnum is amsterdam" {

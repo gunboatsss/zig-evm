@@ -14,9 +14,12 @@ pub const memory_bytes_max: u32 = 1_048_576;
 pub const memory_pool_bytes_max: u32 = 64 * 1024 * 1024;
 pub const code_bytes_max: u32 = 24 * 1024;
 pub const init_code_bytes_max: u32 = 2 * code_bytes_max;
+/// Foundry test contracts often exceed EIP-170 / EIP-3860.
+pub const forge_code_bytes_max: u32 = 64 * 1024;
+pub const forge_init_code_bytes_max: u32 = 64 * 1024;
 pub const code_pool_bytes_max: u32 = 2 * 1024 * 1024;
 pub const calldata_bytes_max: u32 = 128 * 1024;
-pub const returndata_bytes_max: u32 = 32 * 1024;
+pub const returndata_bytes_max: u32 = 64 * 1024;
 pub const log_topics_max: u32 = 4;
 pub const log_data_bytes_max: u32 = 32 * 1024;
 pub const logs_max: u32 = 1024;
@@ -31,7 +34,16 @@ pub const accessed_storage_max: u32 = 4096;
 pub const authorizations_max: u32 = 8_192;
 pub const jumpdest_table_max: u32 = 8192;
 pub const trace_steps_max: u32 = 10_000_000;
+/// Compact debugger steps (not a full stack/memory snapshot per step).
+pub const debug_trace_steps_max: u32 = 65_536;
+pub const debug_call_segments_max: u32 = 8_192;
+pub const debug_query_cap: u32 = 25;
+pub const debug_stack_dump_max: u32 = 64;
+pub const debug_memory_hex_max: u32 = 512;
 pub const forge_artifact_bytes_max: u32 = 32 * 1024 * 1024;
+pub const forge_artifacts_max: u32 = 512;
+pub const forge_name_pool_bytes_max: u32 = 256 * 1024;
+pub const forge_code_pool_bytes_max: u32 = 16 * 1024 * 1024;
 pub const jsontest_bytes_max: u32 = 64 * 1024 * 1024;
 pub const forge_sig_bytes_max: u32 = 256;
 pub const cheat_mocks_max: u32 = 32;
@@ -48,6 +60,8 @@ comptime {
     std.debug.assert(memory_pool_bytes_max >= memory_bytes_max);
     std.debug.assert(code_bytes_max > 0);
     std.debug.assert(init_code_bytes_max == 49_152);
+    std.debug.assert(forge_code_bytes_max >= code_bytes_max);
+    std.debug.assert(forge_init_code_bytes_max >= init_code_bytes_max);
     std.debug.assert(accounts_max > 0);
     std.debug.assert(authorizations_max <= accounts_max);
     std.debug.assert(authorizations_max <= accessed_addresses_max);
@@ -55,4 +69,14 @@ comptime {
     std.debug.assert(log_data_pool_bytes_max > 0);
     std.debug.assert(jsontest_bytes_max > 0);
     std.debug.assert(authorizations_max > 0);
+    std.debug.assert(debug_trace_steps_max > 0);
+    std.debug.assert(debug_trace_steps_max <= trace_steps_max);
+    std.debug.assert(debug_call_segments_max > 0);
+    std.debug.assert(debug_query_cap > 0);
+    std.debug.assert(debug_stack_dump_max > 0);
+    std.debug.assert(debug_memory_hex_max > 0);
+    std.debug.assert(debug_memory_hex_max % 32 == 0);
+    std.debug.assert(forge_artifacts_max > 0);
+    std.debug.assert(forge_name_pool_bytes_max > 0);
+    std.debug.assert(forge_code_pool_bytes_max > 0);
 }

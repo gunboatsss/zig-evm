@@ -1,6 +1,7 @@
 //! Foundry hevm cheatcodes at `address(uint160(uint256(keccak256("hevm cheat code"))))`.
 
 const std = @import("std");
+const artifact = @import("artifact.zig");
 const limits = @import("limits.zig");
 const precompile = @import("precompile.zig");
 const state_mod = @import("state.zig");
@@ -22,6 +23,7 @@ pub const Result = struct {
     restore_logs: bool = false,
     log_count: u32 = 0,
     log_data_used: u32 = 0,
+    spawn_create: bool = false,
 };
 
 pub const Prank = struct {
@@ -70,6 +72,13 @@ pub const State = struct {
     snapshots: [limits.cheat_snapshots_max]Snapshot = undefined,
     snapshot_count: u32 = 0,
     skipped: bool = false,
+    artifacts: ?*const artifact.Store = null,
+    init_code: [limits.init_code_bytes_max]u8 = undefined,
+    init_code_len: u32 = 0,
+    deploy_pending: bool = false,
+    create_value: u256 = 0,
+    create_salt: u256 = 0,
+    use_create2: bool = false,
 };
 
 pub fn apply(
@@ -133,6 +142,16 @@ fn apply_state(
     if (is(calldata, "mockCall(address,bytes,bytes)")) return mock_call(cheats, calldata, false);
     if (is(calldata, "mockCall(address,uint256,bytes,bytes)")) return mock_call(cheats, calldata, true);
     if (is(calldata, "clearMockedCalls()")) return clear_mocks(cheats);
+    if (is(calldata, "getCode(string)")) return get_code(cheats, calldata, out, false);
+    if (is(calldata, "getDeployedCode(string)")) return get_code(cheats, calldata, out, true);
+    if (is(calldata, "deployCode(string)")) return deploy_code(cheats, calldata, null, null, null);
+    if (is(calldata, "deployCode(string,bytes)")) return deploy_code(cheats, calldata, 1, null, null);
+    if (is(calldata, "deployCode(string,uint256)")) return deploy_code(cheats, calldata, null, 1, null);
+    if (is(calldata, "deployCode(string,bytes,uint256)")) return deploy_code(cheats, calldata, 1, 2, null);
+    if (is(calldata, "deployCode(string,bytes32)")) return deploy_code(cheats, calldata, null, null, 1);
+    if (is(calldata, "deployCode(string,bytes,bytes32)")) return deploy_code(cheats, calldata, 1, null, 2);
+    if (is(calldata, "deployCode(string,uint256,bytes32)")) return deploy_code(cheats, calldata, null, 1, 2);
+    if (is(calldata, "deployCode(string,bytes,uint256,bytes32)")) return deploy_code(cheats, calldata, 1, 2, 3);
     if (is_noop(calldata)) return ok(0);
     return revert_empty();
 }
@@ -364,6 +383,48 @@ fn clear_mocks(cheats: *State) Result {
     return ok(0);
 }
 
+fn get_code(cheats: *State, data: []const u8, out: []u8, deployed: bool) Result {
+    const path = dyn_bytes(data, 0) orelse return revert_empty();
+    const catalog = cheats.artifacts orelse return revert_empty();
+    const code = if (deployed) catalog.deployed_of(path) else catalog.creation_of(path);
+    return write_bytes(out, code orelse return revert_empty());
+}
+
+fn deploy_code(
+    cheats: *State,
+    data: []const u8,
+    args_pos: ?u32,
+    value_pos: ?u32,
+    salt_pos: ?u32,
+) Result {
+    const path = dyn_bytes(data, 0) orelse return revert_empty();
+    const catalog = cheats.artifacts orelse return revert_empty();
+    const code = catalog.creation_of(path) orelse return revert_empty();
+    const args = if (args_pos) |pos| dyn_bytes(data, pos) orelse return revert_empty() else data[0..0];
+    const total = code.len + args.len;
+    if (total > limits.init_code_bytes_max) return revert_empty();
+    if (code.len > 0) @memcpy(cheats.init_code[0..code.len], code);
+    if (args.len > 0) @memcpy(cheats.init_code[code.len..total], args);
+    cheats.init_code_len = @intCast(total);
+    cheats.create_value = if (value_pos) |pos| arg_word(data, pos) else 0;
+    cheats.create_salt = if (salt_pos) |pos| arg_word(data, pos) else 0;
+    cheats.use_create2 = salt_pos != null;
+    var result = ok(0);
+    result.spawn_create = true;
+    return result;
+}
+
+fn write_bytes(out: []u8, data: []const u8) Result {
+    const padded = std.mem.alignForward(u32, @intCast(data.len), 32);
+    const total: u32 = 64 + padded;
+    if (out.len < total) return revert_empty();
+    write_word_at(out, 0, 32);
+    write_word_at(out, 32, data.len);
+    if (data.len > 0) @memcpy(out[64 .. 64 + data.len], data);
+    if (padded > data.len) @memset(out[64 + data.len .. 64 + padded], 0);
+    return ok(total);
+}
+
 fn append_mock(cheats: *State, bytes: []const u8) ?u32 {
     const len: u32 = @intCast(bytes.len);
     if (cheats.mock_data_used + len > limits.cheat_mock_data_bytes_max) return null;
@@ -486,4 +547,50 @@ test "deal updates balance" {
     const result = apply(&cheats, &world, &env, 0, &calldata, &out, 0, 0);
     try std.testing.expect(!result.revert);
     try std.testing.expectEqual(@as(u256, 7), world.get_balance(0x42));
+}
+
+test "getCode returns creation bytecode" {
+    const catalog = try std.testing.allocator.create(artifact.Store);
+    defer std.testing.allocator.destroy(catalog);
+    catalog.init();
+    const code = [_]u8{ 0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    try catalog.put("Counter.sol", "Counter", "Counter.sol/Counter.json", &code, &code);
+    var world: world_mod.World = undefined;
+    world.init();
+    var env = state_mod.ExecutionContext.default();
+    var cheats = State{ .artifacts = catalog };
+    var calldata: [4 + 64 + 32]u8 = @splat(0);
+    const sel = sel4("getCode(string)");
+    @memcpy(calldata[0..4], &sel);
+    calldata[4 + 31] = 32;
+    calldata[4 + 32 + 31] = 7;
+    @memcpy(calldata[4 + 64 .. 4 + 71], "Counter");
+    var out: [128]u8 = undefined;
+    const result = apply(&cheats, &world, &env, 0, &calldata, &out, 0, 0);
+    try std.testing.expect(!result.revert);
+    try std.testing.expectEqual(@as(u32, 96), result.len);
+    try std.testing.expectEqualSlices(u8, &code, out[64 .. 64 + code.len]);
+}
+
+test "deployCode stages initcode" {
+    const catalog = try std.testing.allocator.create(artifact.Store);
+    defer std.testing.allocator.destroy(catalog);
+    catalog.init();
+    const code = [_]u8{ 0x60, 0x00, 0xf3 };
+    try catalog.put("Counter.sol", "Counter", "Counter.sol/Counter.json", &code, &.{});
+    var world: world_mod.World = undefined;
+    world.init();
+    var env = state_mod.ExecutionContext.default();
+    var cheats = State{ .artifacts = catalog };
+    var calldata: [4 + 64 + 32]u8 = @splat(0);
+    const sel = sel4("deployCode(string)");
+    @memcpy(calldata[0..4], &sel);
+    calldata[4 + 31] = 32;
+    calldata[4 + 32 + 31] = 7;
+    @memcpy(calldata[4 + 64 .. 4 + 71], "Counter");
+    var out: [32]u8 = undefined;
+    const result = apply(&cheats, &world, &env, 0, &calldata, &out, 0, 0);
+    try std.testing.expect(!result.revert);
+    try std.testing.expect(result.spawn_create);
+    try std.testing.expectEqualSlices(u8, &code, cheats.init_code[0..cheats.init_code_len]);
 }
