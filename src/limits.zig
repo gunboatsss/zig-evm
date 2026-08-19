@@ -19,6 +19,12 @@ pub const forge_code_bytes_max: u32 = 64 * 1024;
 pub const forge_init_code_bytes_max: u32 = 64 * 1024;
 pub const code_pool_bytes_max: u32 = 2 * 1024 * 1024;
 pub const calldata_bytes_max: u32 = 128 * 1024;
+/// EIP-7823: each MODEXP length field is at most 1024 bytes.
+pub const modexp_len_bytes_max: u32 = 1024;
+/// Scratch for `std.math.big` during MODEXP (base/exp/mod + mul/div).
+pub const modexp_scratch_bytes_max: u32 = 64 * 1024;
+/// EIP-7951 `P256VERIFY` input is exactly 160 bytes.
+pub const p256verify_input_bytes: u32 = 160;
 pub const returndata_bytes_max: u32 = 64 * 1024;
 pub const log_topics_max: u32 = 4;
 pub const log_data_bytes_max: u32 = 32 * 1024;
@@ -29,7 +35,9 @@ pub const accounts_max: u32 = 8_192;
 pub const storage_slots_max: u32 = 4096;
 pub const journal_entries_max: u32 = 65_536;
 pub const accessed_addresses_max: u32 = 8_192;
-pub const accessed_storage_max: u32 = 4096;
+/// EIP-7825 tx gas cap is 2^24; access-list keys cost 1900, so a padded list
+/// can hold ~8817 unique keys. Warm-slot tracking must fit that list.
+pub const accessed_storage_max: u32 = 16_384;
 /// EIP-7702 authorization tuples on one type-4 transaction.
 pub const authorizations_max: u32 = 8_192;
 pub const jumpdest_table_max: u32 = 8192;
@@ -63,11 +71,15 @@ comptime {
     std.debug.assert(forge_code_bytes_max >= code_bytes_max);
     std.debug.assert(forge_init_code_bytes_max >= init_code_bytes_max);
     std.debug.assert(accounts_max > 0);
+    std.debug.assert(accessed_storage_max >= 8_817);
     std.debug.assert(authorizations_max <= accounts_max);
     std.debug.assert(authorizations_max <= accessed_addresses_max);
     std.debug.assert(logs_max > 0);
     std.debug.assert(log_data_pool_bytes_max > 0);
     std.debug.assert(jsontest_bytes_max > 0);
+    std.debug.assert(modexp_len_bytes_max == 1024);
+    std.debug.assert(modexp_scratch_bytes_max >= 16 * 1024);
+    std.debug.assert(p256verify_input_bytes == 160);
     std.debug.assert(authorizations_max > 0);
     std.debug.assert(debug_trace_steps_max > 0);
     std.debug.assert(debug_trace_steps_max <= trace_steps_max);

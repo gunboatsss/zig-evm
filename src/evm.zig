@@ -88,6 +88,20 @@ test "interpreter exp is top to the power of second" {
     try std.testing.expectEqual(@as(u8, 100), result.return_data()[31]);
 }
 
+test "exp gas is 10 plus 50 per exponent byte" {
+    // PUSH1 1 PUSH1 2 EXP STOP → 2**1, exponent 1 byte: 3+3+10+50
+    const one_byte = [_]u8{ 0x60, 0x01, 0x60, 0x02, 0x0a, 0x00 };
+    const one = try execute(std.testing.allocator, &one_byte, &[_]u8{}, 1_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, one.status);
+    try std.testing.expectEqual(@as(u64, 66), one.gas_used);
+
+    // PUSH1 0 PUSH1 2 EXP STOP → 2**0, exponent 0 bytes: 3+3+10
+    const zero = [_]u8{ 0x60, 0x00, 0x60, 0x02, 0x0a, 0x00 };
+    const z = try execute(std.testing.allocator, &zero, &[_]u8{}, 1_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, z.status);
+    try std.testing.expectEqual(@as(u64, 16), z.gas_used);
+}
+
 test "interpreter addmod is (top + second) mod third" {
     // PUSH1 5 PUSH1 4 PUSH1 3 ADDMOD → (3+4)%5
     const code = [_]u8{ 0x60, 0x05, 0x60, 0x04, 0x60, 0x03, 0x08, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
@@ -197,6 +211,25 @@ test "apply_tx access list adds intrinsic gas" {
     const status = try vm.apply_tx(3, &[_]u8{}, 23_400, 0, 1);
     try std.testing.expectEqual(Status.stopped, status);
     try std.testing.expectEqual(@as(u256, 23_400), vm.world.get_balance(2));
+}
+
+test "apply_tx warms an access list larger than 4096 keys" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const key_count: u32 = 5_000;
+    const keys = try std.testing.allocator.alloc(u256, key_count);
+    defer std.testing.allocator.free(keys);
+    for (keys, 0..) |*key, index| key.* = index;
+    const items = [_]AccessListItem{.{ .address = 9, .keys = keys }};
+    vm.access_list = &items;
+    const intrinsic = 21_000 + 2_400 + 1_900 * @as(u64, key_count);
+    try vm.world.set_balance(1, @as(u256, intrinsic) * 2);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const status = try vm.apply_tx(3, &[_]u8{}, intrinsic, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
 }
 
 test "selfdestruct pre-existing transfers and keeps code" {
@@ -364,6 +397,25 @@ test "identity precompile copies calldata" {
     const result = try execute(std.testing.allocator, &code, &calldata, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
     try std.testing.expectEqualSlices(u8, &calldata, result.return_data());
+}
+
+test "modexp precompile 3**2 mod 5" {
+    const code = [_]u8{
+        0x60, 0x63, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY 99
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x63, 0x60, 0x00,
+        0x60, 0x05, 0x61, 0xff, 0xff, 0xfa, // STATICCALL modexp
+        0x60, 0x01, 0x60, 0x00, 0xf3,
+    };
+    var calldata: [99]u8 = @splat(0);
+    calldata[31] = 1;
+    calldata[63] = 1;
+    calldata[95] = 1;
+    calldata[96] = 3;
+    calldata[97] = 2;
+    calldata[98] = 5;
+    const result = try execute(std.testing.allocator, &code, &calldata, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 4), result.return_data()[0]);
 }
 
 fn sel4(sig: []const u8) [4]u8 {

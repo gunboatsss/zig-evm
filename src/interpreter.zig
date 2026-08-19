@@ -415,7 +415,7 @@ pub const Vm = struct {
             try self.exec_cheatcode();
             return;
         }
-        if (precompile.is_precompile(frame.code_address) and !frame.disable_precompiles) {
+        if (precompile.is_precompile(frame.code_address, self.fork) and !frame.disable_precompiles) {
             try self.exec_precompile();
             return;
         }
@@ -882,13 +882,17 @@ pub const Vm = struct {
 
     fn exec_precompile(self: *Vm) !void {
         const frame = self.current();
-        std.debug.assert(precompile.is_precompile(frame.code_address));
-        const input_len: u32 = @intCast(frame.calldata.len);
-        try frame.gas.consume(precompile.gas_cost(frame.code_address, input_len));
+        std.debug.assert(precompile.is_precompile(frame.code_address, self.fork));
+        const cost = precompile.gas_cost(frame.code_address, frame.calldata, self.fork) catch {
+            frame.gas.used = frame.gas.limit;
+            return error.OutOfGas;
+        };
+        try frame.gas.consume(cost);
         self.output_len = try precompile.execute(
             frame.code_address,
             frame.calldata,
             self.output_buffer[0..],
+            self.fork,
         );
         frame.status = .returned;
     }
@@ -1295,6 +1299,7 @@ pub const Vm = struct {
         while (address <= 10) : (address += 1) {
             try self.mark_warm(address);
         }
+        if (self.fork.at_least(.osaka)) try self.mark_warm(0x100);
     }
 
     fn warm_access_list(self: *Vm) !void {
@@ -1497,7 +1502,7 @@ fn exec_exp(frame: *Frame) !u32 {
     const base = try frame.stack.pop();
     const exponent = try frame.stack.pop();
     const exp_bytes = word.exponent_byte_size(exponent);
-    if (exp_bytes > 0) try frame.gas.consume((exp_bytes - 1) * 50);
+    try frame.gas.consume(exp_bytes * gas_mod.gas_exp_byte);
     try frame.stack.push(word.exp(base, exponent));
     return frame.pc + 1;
 }

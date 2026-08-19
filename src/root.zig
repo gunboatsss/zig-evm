@@ -13,6 +13,7 @@ test {
     _ = @import("rlp.zig");
     _ = @import("delegation.zig");
     _ = @import("precompile.zig");
+    _ = @import("modexp.zig");
     _ = @import("cheatcode.zig");
     _ = @import("artifact.zig");
     _ = @import("interpreter.zig");

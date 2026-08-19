@@ -22,12 +22,12 @@ zig build test
 Filled [ethereum/execution-spec-tests](https://github.com/ethereum/execution-spec-tests) state fixtures (v5.4.0, Osaka develop set):
 
 ```bash
-scripts/fetch_eest_fixtures.sh          # smoke subset (PUSH0, TSTORE, MCOPY, CLZ)
-scripts/fetch_eest_fixtures.sh --all    # every state_test in the tarball
+scripts/fetch_eest_fixtures.sh          # every state_test, including EIP-6780
+scripts/fetch_eest_fixtures.sh --smoke  # PUSH0, TSTORE, MCOPY, CLZ, 7702, 6780
 zig build jsontest                      # or: zig-evm jsontest tests/eest/state_tests
 ```
 
-Fixtures live in `tests/eest/` (gitignored). Cases with only a post state-root are skipped; `post.state` is compared account-by-account. Sender and coinbase balances are ignored until gas is charged. `zig build jsontest -Djsontest-path=path` runs a single file or directory.
+Fixtures live in `tests/eest/` (gitignored). Cases with only a post state-root are skipped; `post.state` is compared account-by-account. Sender and coinbase balances are ignored until gas is charged. EIP-6780 is the Osaka `SELFDESTRUCT` rule (same-tx only); Shanghai and earlier posts for those tests are skipped. `zig build jsontest -Djsontest-path=path` runs a single file or directory.
 
 ## Architecture
 
@@ -54,7 +54,7 @@ The interpreter is a loop over a bounded call stack. Nested calls never recurse 
 
 Opcode metadata follows [`ethereum/execution-specs`](https://github.com/ethereum/execution-specs). **Osaka** is the default (`CLZ`, plus Cancun ops `TLOAD`/`TSTORE`, `MCOPY`, `BLOBHASH`/`BLOBBASEFEE`). **Amsterdam** is opt-in (`--fork amsterdam`) and adds `SLOTNUM` and EIP-8024 `DUPN`/`SWAPN`/`EXCHANGE`. Prague remains selectable as an older fork.
 
-External calls (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`) run on an iterative stack of at most **1025 frames** (`depth + 1 > 1024` is rejected, matching [execution-specs](https://github.com/ethereum/execution-specs)). `LOG0`–`LOG4` and the `ecrecover` precompile (`0x01`) are implemented. Remaining precompiles and `SELFDESTRUCT` are not. `BLOBHASH` returns 0.
+External calls (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`) run on an iterative stack of at most **1025 frames** (`depth + 1 > 1024` is rejected, matching [execution-specs](https://github.com/ethereum/execution-specs)). `LOG0`–`LOG4` and `SELFDESTRUCT` (EIP-6780) are implemented. Precompiles: `ecrecover` (`0x01`), `sha256` (`0x02`), `identity` (`0x04`), `modexp` (`0x05`), and Osaka `p256verify` (`0x100`). `BLOBHASH` returns 0.
 
 ## Tiger Style highlights
 

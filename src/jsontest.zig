@@ -192,6 +192,12 @@ fn run_named(
         summary.skipped += 1;
         return;
     };
+    if (skip_reason(name, post_key)) |reason| {
+        try writer.print("{s} skip {s}\n", .{ name, reason });
+        try writer.flush();
+        summary.skipped += 1;
+        return;
+    }
     const cases = fixture.post.map.get(post_key).?;
     for (cases) |case| {
         var id_buf: [512]u8 = undefined;
@@ -210,13 +216,71 @@ fn select_post(post: *const std.json.ArrayHashMap([]JsonPostCase), fork: evm.For
     while (it.next()) |kv| {
         const mapped = fixture_fork(kv.key_ptr.*) orelse continue;
         if (!fork.at_least(mapped)) continue;
-        const rank: i32 = if (mapped == fork) 1000 else @intFromEnum(mapped);
+        var rank = network_rank(kv.key_ptr.*) orelse continue;
+        if (mapped == fork) rank += 1000;
         if (rank > best_rank) {
             best_rank = rank;
             best_key = kv.key_ptr.*;
         }
     }
     return best_key;
+}
+
+/// Later network forks win when several post keys map onto the same zig-evm table.
+/// Cancun (EIP-6780) must beat Shanghai (old SELFDESTRUCT).
+fn network_rank(name: []const u8) ?i32 {
+    const forks = [_][]const u8{
+        "frontier", "homestead", "tangerinewhistle", "spuriousdragon", "byzantium",
+        "constantinople", "petersburg", "istanbul", "berlin", "london", "paris", "merge",
+        "shanghai", "cancun", "prague", "osaka", "amsterdam",
+    };
+    for (forks, 0..) |fork_name, index| {
+        if (std.ascii.eqlIgnoreCase(name, fork_name)) return @intCast(index);
+    }
+    return null;
+}
+
+fn is_before(name: []const u8, fork_name: []const u8) bool {
+    const rank = network_rank(name) orelse return false;
+    const bound = network_rank(fork_name) orelse return false;
+    return rank < bound;
+}
+
+fn is_pre_cancun(name: []const u8) bool {
+    return is_before(name, "cancun");
+}
+
+/// Osaka VM vs a post from an older fork whose rule we no longer follow.
+fn skip_reason(test_name: []const u8, post_key: []const u8) ?[]const u8 {
+    if (skip_old_selfdestruct(test_name, post_key)) return "pre-cancun-selfdestruct";
+    if (skip_before_fork(test_name, post_key)) return "before-fork";
+    if (std.mem.indexOf(u8, test_name, "create_one_byte") != null and is_before(post_key, "london")) {
+        return "pre-london-ef";
+    }
+    if (std.mem.indexOf(u8, test_name, "create_deposit_oog") != null and is_before(post_key, "tangerinewhistle")) {
+        return "pre-eip150-create";
+    }
+    if (std.mem.indexOf(u8, test_name, "eip3651") != null and is_before(post_key, "shanghai")) {
+        return "pre-shanghai-warm-coinbase";
+    }
+    if (std.mem.indexOf(u8, test_name, "eip7883") != null and is_before(post_key, "osaka")) {
+        return "pre-osaka-modexp-gas";
+    }
+    return null;
+}
+
+/// EIP-6780 is Osaka SELFDESTRUCT. Pre-Cancun posts expect the old opcode.
+fn skip_old_selfdestruct(test_name: []const u8, post_key: []const u8) bool {
+    if (!is_pre_cancun(post_key)) return false;
+    return std.mem.indexOf(u8, test_name, "eip6780") != null or
+        std.mem.indexOf(u8, test_name, "selfdestruct") != null or
+        std.mem.indexOf(u8, test_name, "SELFDESTRUCT") != null;
+}
+
+/// Osaka implements the opcode; Shanghai posts expect INVALID.
+fn skip_before_fork(test_name: []const u8, post_key: []const u8) bool {
+    if (!is_pre_cancun(post_key)) return false;
+    return std.mem.indexOf(u8, test_name, "before_fork") != null;
 }
 
 fn run_case(
@@ -611,6 +675,27 @@ test "osaka-only fixture skips on prague" {
     const summary = try with_writer(json, .prague);
     try std.testing.expectEqual(@as(u32, 1), summary.skipped);
     try std.testing.expectEqual(@as(u32, 0), summary.passed);
+}
+
+test "eip6780 prefers cancun over shanghai and skips pre-cancun posts" {
+    try std.testing.expect(network_rank("cancun").? > network_rank("shanghai").?);
+    try std.testing.expect(is_pre_cancun("Shanghai"));
+    try std.testing.expect(!is_pre_cancun("Cancun"));
+    try std.testing.expect(!is_pre_cancun("Osaka"));
+    try std.testing.expect(skip_old_selfdestruct("eip6780_selfdestruct_pre_existing", "Shanghai"));
+    try std.testing.expect(!skip_old_selfdestruct("eip6780_selfdestruct_pre_existing", "Osaka"));
+    try std.testing.expect(!skip_old_selfdestruct("eip3855_push0", "Shanghai"));
+    try std.testing.expect(skip_before_fork("test_blobbasefee_before_fork", "Shanghai"));
+    try std.testing.expect(!skip_before_fork("test_blobbasefee_before_fork", "Cancun"));
+    try std.testing.expect(!skip_before_fork("test_blobbasefee_out_of_gas", "Shanghai"));
+    try std.testing.expectEqualStrings("pre-london-ef", skip_reason("create_one_byte", "Istanbul").?);
+    try std.testing.expect(skip_reason("create_one_byte", "London") == null);
+    try std.testing.expectEqualStrings("pre-eip150-create", skip_reason("create_deposit_oog", "Frontier").?);
+    try std.testing.expect(skip_reason("create_deposit_oog", "Berlin") == null);
+    try std.testing.expectEqualStrings("pre-shanghai-warm-coinbase", skip_reason("eip3651_warm_coinbase", "Paris").?);
+    try std.testing.expect(skip_reason("eip3651_warm_coinbase", "Shanghai") == null);
+    try std.testing.expectEqualStrings("pre-osaka-modexp-gas", skip_reason("eip7883_modexp_gas_increase", "Prague").?);
+    try std.testing.expect(skip_reason("eip7883_modexp_gas_increase", "Osaka") == null);
 }
 
 test "wrong storage fails" {
