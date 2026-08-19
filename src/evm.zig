@@ -73,6 +73,24 @@ test "interpreter add" {
     try std.testing.expectEqual(Status.stopped, result.status);
 }
 
+test "blockhash of parent is nonzero" {
+    const code = [_]u8{ 0x60, 0x00, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    var ctx = ExecutionContext.default();
+    ctx.number = 1;
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expect(!std.mem.allEqual(u8, result.return_data(), 0));
+}
+
+test "blockhash of current number is zero" {
+    const code = [_]u8{ 0x60, 0x01, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    var ctx = ExecutionContext.default();
+    ctx.number = 1;
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expect(std.mem.allEqual(u8, result.return_data(), 0));
+}
+
 test "interpreter gt is top greater than second" {
     const code = [_]u8{ 0x60, 0x02, 0x60, 0x03, 0x11, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());

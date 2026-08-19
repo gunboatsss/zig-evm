@@ -6,6 +6,8 @@ const opcode_mod = @import("opcode.zig");
 const precompile = @import("precompile.zig");
 const cheatcode = @import("cheatcode.zig");
 const rlp = @import("rlp.zig");
+const header_mod = @import("header.zig");
+const trie_mod = @import("trie.zig");
 const delegation = @import("delegation.zig");
 const stack_mod = @import("stack.zig");
 const state_mod = @import("state.zig");
@@ -103,6 +105,8 @@ pub const Vm = struct {
     created_count: u32,
     deleted: [limits.accounts_max]u256,
     delete_count: u32,
+    block_hashes: [limits.block_hashes_max][32]u8,
+    block_hash_count: u32,
     /// Null on the jsontest / forge-test path. Set only by `debug`.
     trace: ?*trace_mod.Trace,
 
@@ -136,6 +140,16 @@ pub const Vm = struct {
         self.authorizations = &.{};
         self.created_count = 0;
         self.delete_count = 0;
+        self.block_hash_count = header_mod.fill_window(
+            &self.block_hashes,
+            context.number,
+            context.coinbase,
+            context.gas_limit,
+            context.timestamp,
+            context.base_fee,
+            context.prev_randao,
+            trie_mod.empty_root,
+        );
         self.trace = null;
         try self.world.set_code(context.address, code);
         self.world.journal_count = 0;
@@ -176,6 +190,7 @@ pub const Vm = struct {
         self.access_list = &.{};
         self.authorizations = &.{};
         self.trace = null;
+        self.block_hash_count = 0;
         self.reset_tx();
     }
 
@@ -198,6 +213,7 @@ pub const Vm = struct {
         const address = rlp.create_address(sender, nonce);
         try self.world.increment_nonce(sender);
         try self.mark_warm(address);
+        if (self.world.create_collision(address)) return 0;
         var child_context = context;
         child_context.address = address;
         child_context.call_value = value;
@@ -490,7 +506,7 @@ pub const Vm = struct {
             .blobhash => try exec_blobhash(frame),
             .blobbasefee => try exec_push_const(frame, self.env.blob_base_fee),
             .slotnum => try exec_push_const(frame, self.env.slot_number),
-            .blockhash => try exec_blockhash(frame),
+            .blockhash => try self.exec_blockhash(),
             .pop => try exec_pop(frame),
             .mload => try exec_mload(frame),
             .mstore => try exec_mstore(frame),
@@ -529,6 +545,19 @@ pub const Vm = struct {
             .log4 => try self.exec_log(4),
             else => return error.InvalidOpcode,
         };
+    }
+
+    fn exec_blockhash(self: *Vm) !u32 {
+        const frame = self.current();
+        const wanted = try frame.stack.pop();
+        const hash = header_mod.lookup(
+            &self.block_hashes,
+            self.block_hash_count,
+            self.env.number,
+            wanted,
+        );
+        try frame.stack.push(hash);
+        return frame.pc + 1;
     }
 
     fn exec_sload(self: *Vm) !u32 {
@@ -787,7 +816,7 @@ pub const Vm = struct {
         else
             rlp.create_address(sender, nonce);
         try self.mark_warm(contract);
-        if (self.world.get_nonce(contract) != 0 or self.world.code_of(contract).len != 0) {
+        if (self.world.create_collision(contract)) {
             try self.world.increment_nonce(sender);
             try frame.stack.push(0);
             return frame.pc + 1;
@@ -946,7 +975,7 @@ pub const Vm = struct {
         else
             rlp.create_address(sender, nonce);
         self.mark_warm(contract) catch return false;
-        if (self.world.get_nonce(contract) != 0 or self.world.code_of(contract).len != 0) {
+        if (self.world.create_collision(contract)) {
             self.world.increment_nonce(sender) catch return false;
             return false;
         }
@@ -1604,12 +1633,6 @@ fn exec_mcopy(frame: *Frame) !u32 {
 }
 
 fn exec_blobhash(frame: *Frame) !u32 {
-    _ = try frame.stack.pop();
-    try frame.stack.push(0);
-    return frame.pc + 1;
-}
-
-fn exec_blockhash(frame: *Frame) !u32 {
     _ = try frame.stack.pop();
     try frame.stack.push(0);
     return frame.pc + 1;

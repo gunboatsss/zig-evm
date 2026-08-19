@@ -83,7 +83,7 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\functions from `forge build` artifacts (no fuzz or invariants).
         \\`jsontest` runs EEST / GeneralStateTests JSON from
         \\`tests/eest/state_tests` (fetch with scripts/fetch_eest_fixtures.sh).
-        \\Cases with only a post state-root are skipped (no MPT). EIP-6780 is
+        \\A 32-byte post.hash is the Merkle Patricia state root. EIP-6780 is
         \\included (Osaka SELFDESTRUCT); pre-Cancun posts for it are skipped.
         \\
         \\Examples:

@@ -11,6 +11,8 @@ test {
     _ = @import("opcode.zig");
     _ = @import("world.zig");
     _ = @import("rlp.zig");
+    _ = @import("header.zig");
+    _ = @import("trie.zig");
     _ = @import("delegation.zig");
     _ = @import("precompile.zig");
     _ = @import("modexp.zig");

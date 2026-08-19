@@ -58,6 +58,16 @@ pub const cheat_mocks_max: u32 = 32;
 pub const cheat_mock_data_bytes_max: u32 = 16 * 1024;
 pub const cheat_snapshots_max: u32 = 16;
 pub const cheat_expect_bytes_max: u32 = 1024;
+/// Yellow Paper BLOCKHASH window.
+pub const block_hashes_max: u32 = 256;
+pub const header_rlp_bytes_max: u32 = 1024;
+pub const trie_nibble_max: u32 = 64;
+pub const trie_leaves_max: u32 = accounts_max + storage_slots_max;
+pub const trie_nodes_max: u32 = trie_leaves_max * 4;
+pub const trie_value_bytes_max: u32 = accounts_max * 160 + storage_slots_max * 48;
+pub const trie_account_bytes_max: u32 = 160;
+pub const trie_node_bytes_max: u32 = 1024;
+pub const trie_empty_child: u32 = 0;
 
 comptime {
     std.debug.assert(call_depth_limit == 1024);
@@ -91,4 +101,10 @@ comptime {
     std.debug.assert(forge_artifacts_max > 0);
     std.debug.assert(forge_name_pool_bytes_max > 0);
     std.debug.assert(forge_code_pool_bytes_max > 0);
+    std.debug.assert(block_hashes_max == 256);
+    std.debug.assert(header_rlp_bytes_max >= 512);
+    std.debug.assert(trie_nibble_max == 64);
+    std.debug.assert(trie_leaves_max >= accounts_max);
+    std.debug.assert(trie_nodes_max >= trie_leaves_max);
+    std.debug.assert(trie_empty_child == 0);
 }

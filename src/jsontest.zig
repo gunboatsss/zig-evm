@@ -1,11 +1,13 @@
 //! GeneralStateTests / EEST `state_test` JSON runner.
 //!
-//! No Merkle trie: cases with only `post.hash` are skipped. Cases that include
-//! `post.state` (or top-level `postState`) are compared account-by-account.
+//! Account dumps in `post.state` are compared field-by-field. A 32-byte
+//! `post.hash` is compared to a check-time Merkle Patricia state root.
 
 const std = @import("std");
 const evm = @import("evm.zig");
+const header_mod = @import("header.zig");
 const limits = @import("limits.zig");
+const trie_mod = @import("trie.zig");
 const word = @import("u256.zig");
 const world_mod = @import("world.zig");
 
@@ -290,7 +292,9 @@ fn run_case(
     fork: evm.Fork,
 ) !Outcome {
     if (has_exception(case)) return .skip;
-    const state = state_map(&case, fixture) orelse return .skip;
+    const state = state_map(&case, fixture);
+    const want_root = parse_root(case.hash);
+    if (state == null and want_root == null) return .skip;
     const tx = fixture.transaction;
     if (case.indexes.data >= tx.data.len) return .fail;
     if (case.indexes.gas >= tx.gasLimit.len) return .fail;
@@ -300,13 +304,24 @@ fn run_case(
     const gas_limit = try parse_u64(tx.gasLimit[case.indexes.gas]);
     const value = try parse_u256(tx.value[case.indexes.value]);
     if (gas_limit == 0) return .fail;
-    return apply_and_check(allocator, fixture, state, fork, data, gas_limit, value, case.indexes.data);
+    return apply_and_check(
+        allocator,
+        fixture,
+        state,
+        want_root,
+        fork,
+        data,
+        gas_limit,
+        value,
+        case.indexes.data,
+    );
 }
 
 fn apply_and_check(
     allocator: std.mem.Allocator,
     fixture: *const JsonTest,
-    state: *const std.json.ArrayHashMap(JsonAccount),
+    state: ?*const std.json.ArrayHashMap(JsonAccount),
+    want_root: ?[32]u8,
     fork: evm.Fork,
     data: []const u8,
     gas_limit: u64,
@@ -320,6 +335,7 @@ fn apply_and_check(
     vm.world.journal_count = 0;
     const sender = try sender_of(fixture.transaction);
     try bind_env(vm, fixture, sender);
+    try fill_block_hashes(allocator, vm);
     const access = try parse_access_list(allocator, fixture.transaction.accessLists, data_index);
     defer free_access_list(allocator, access);
     vm.access_list = access;
@@ -328,8 +344,38 @@ fn apply_and_check(
     vm.authorizations = auths;
     const to = try call_target(fixture.transaction.to);
     _ = vm.apply_tx(to, data, gas_limit, value, sender) catch return .fail;
-    check_state(&vm.world, state, sender, vm.env.coinbase) catch return .fail;
+    if (state) |expected| {
+        check_state(&vm.world, expected) catch return .fail;
+    }
+    if (want_root) |root| {
+        check_root(allocator, &vm.world, root) catch return .fail;
+    }
     return .pass;
+}
+
+fn fill_block_hashes(allocator: std.mem.Allocator, vm: *evm.Vm) !void {
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    trie.reset();
+    const pre_root = try trie.world_root(&vm.world);
+    vm.block_hash_count = header_mod.fill_window(
+        &vm.block_hashes,
+        vm.env.number,
+        vm.env.coinbase,
+        vm.env.gas_limit,
+        vm.env.timestamp,
+        vm.env.base_fee,
+        vm.env.prev_randao,
+        pre_root,
+    );
+}
+
+fn check_root(allocator: std.mem.Allocator, world: *const world_mod.World, want: [32]u8) !void {
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    trie.reset();
+    const got = try trie.world_root(world);
+    if (!std.mem.eql(u8, &got, &want)) return error.StateRootMismatch;
 }
 
 fn state_map(
@@ -398,12 +444,10 @@ fn bind_env(vm: *evm.Vm, fixture: *const JsonTest, sender: u256) !void {
 fn check_state(
     world: *const world_mod.World,
     expected: *const std.json.ArrayHashMap(JsonAccount),
-    sender: u256,
-    coinbase: u256,
 ) !void {
     var it = expected.map.iterator();
     while (it.next()) |kv| {
-        try check_account(world, kv.key_ptr.*, kv.value_ptr, sender, coinbase);
+        try check_account(world, kv.key_ptr.*, kv.value_ptr);
     }
 }
 
@@ -411,14 +455,10 @@ fn check_account(
     world: *const world_mod.World,
     addr_text: []const u8,
     account: *const JsonAccount,
-    sender: u256,
-    coinbase: u256,
 ) !void {
     const addr = try parse_address(addr_text);
     if (world.get_nonce(addr) != try parse_u64(account.nonce)) return error.NonceMismatch;
-    // Fee accounts: other opcodes still have inexact gas (CALL extras, MCOPY, …).
-    const fee_account = addr == sender or addr == coinbase;
-    if (!fee_account and world.get_balance(addr) != try parse_u256(account.balance)) {
+    if (world.get_balance(addr) != try parse_u256(account.balance)) {
         return error.BalanceMismatch;
     }
     var code_buf: [limits.code_bytes_max]u8 = undefined;
@@ -600,6 +640,14 @@ fn parse_hex_alloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, trimmed.len / 2);
     errdefer allocator.free(out);
     _ = try parse_hex_into(text, out);
+    return out;
+}
+
+fn parse_root(text: []const u8) ?[32]u8 {
+    const hex = strip0x(text);
+    if (hex.len != 64) return null;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch return null;
     return out;
 }
 
