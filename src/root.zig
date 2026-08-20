@@ -11,8 +11,11 @@ test {
     _ = @import("opcode.zig");
     _ = @import("world.zig");
     _ = @import("rlp.zig");
+    _ = @import("header.zig");
+    _ = @import("trie.zig");
     _ = @import("delegation.zig");
     _ = @import("precompile.zig");
+    _ = @import("modexp.zig");
     _ = @import("cheatcode.zig");
     _ = @import("artifact.zig");
     _ = @import("interpreter.zig");
@@ -21,5 +24,6 @@ test {
     _ = @import("evm.zig");
     _ = @import("forge_test.zig");
     _ = @import("jsontest.zig");
+    _ = @import("chaintest.zig");
     std.testing.refAllDecls(@This());
 }

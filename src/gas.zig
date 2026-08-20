@@ -47,11 +47,19 @@ pub const gas_selfdestruct: u64 = 5000;
 pub const gas_selfdestruct_new_account: u64 = 25000;
 pub const gas_code_deposit: u64 = 200;
 pub const gas_init_code_word: u64 = 2;
+/// EIP-160: extra EXP cost per byte of the exponent.
+pub const gas_exp_byte: u64 = 50;
 pub const gas_ecrecover: u64 = 3000;
 pub const gas_sha256_base: u64 = 60;
 pub const gas_sha256_word: u64 = 12;
 pub const gas_identity_base: u64 = 15;
 pub const gas_identity_word: u64 = 3;
+/// EIP-2565 minimum (Prague and earlier).
+pub const gas_modexp_min_prague: u64 = 200;
+/// EIP-7883 minimum (Osaka).
+pub const gas_modexp_min_osaka: u64 = 500;
+/// EIP-7951 `P256VERIFY`.
+pub const gas_p256verify: u64 = 6900;
 pub const gas_log_data: u64 = 8;
 pub const gas_tx: u64 = 21_000;
 pub const gas_tx_data_zero: u64 = 4;

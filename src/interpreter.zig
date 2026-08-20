@@ -6,6 +6,8 @@ const opcode_mod = @import("opcode.zig");
 const precompile = @import("precompile.zig");
 const cheatcode = @import("cheatcode.zig");
 const rlp = @import("rlp.zig");
+const header_mod = @import("header.zig");
+const trie_mod = @import("trie.zig");
 const delegation = @import("delegation.zig");
 const stack_mod = @import("stack.zig");
 const state_mod = @import("state.zig");
@@ -73,6 +75,25 @@ pub const AccessListItem = struct {
 
 pub const Authorization = delegation.Authorization;
 
+pub const BlockTx = struct {
+    to: ?u256,
+    data: []const u8,
+    gas_limit: u64,
+    value: u256,
+    sender: u256,
+    gas_price: u256,
+    access_list: []const AccessListItem = &.{},
+    authorizations: []const Authorization = &.{},
+};
+
+/// EIP-4788 / EIP-2935 / EIP-7002 / EIP-7251 system caller.
+const system_address: u256 = 0xfffffffffffffffffffffffffffffffffffffffe;
+const beacon_roots_address: u256 = 0x000F3dF6D732807EF1319Fb7B8BB8522d0BEAC02;
+const history_storage_address: u256 = 0x0000F90827F1C53a10cb7A02335B175320002935;
+const withdrawal_request_address: u256 = 0x00000961Ef480Eb55e80D19ad83579A64c007002;
+const consolidation_request_address: u256 = 0x0000BBddc7CE488642fb579F8B00f3A590007251;
+const system_tx_gas: u64 = 30_000_000;
+
 pub const Vm = struct {
     world: world_mod.World,
     frames: [limits.call_frames_max]Frame,
@@ -103,6 +124,9 @@ pub const Vm = struct {
     created_count: u32,
     deleted: [limits.accounts_max]u256,
     delete_count: u32,
+    block_hashes: [limits.block_hashes_max][32]u8,
+    block_hash_count: u32,
+    tx_gas_used: u64,
     /// Null on the jsontest / forge-test path. Set only by `debug`.
     trace: ?*trace_mod.Trace,
 
@@ -136,6 +160,16 @@ pub const Vm = struct {
         self.authorizations = &.{};
         self.created_count = 0;
         self.delete_count = 0;
+        self.block_hash_count = header_mod.fill_window(
+            &self.block_hashes,
+            context.number,
+            context.coinbase,
+            context.gas_limit,
+            context.timestamp,
+            context.base_fee,
+            context.prev_randao,
+            trie_mod.empty_root,
+        );
         self.trace = null;
         try self.world.set_code(context.address, code);
         self.world.journal_count = 0;
@@ -176,6 +210,7 @@ pub const Vm = struct {
         self.access_list = &.{};
         self.authorizations = &.{};
         self.trace = null;
+        self.block_hash_count = 0;
         self.reset_tx();
     }
 
@@ -198,6 +233,7 @@ pub const Vm = struct {
         const address = rlp.create_address(sender, nonce);
         try self.world.increment_nonce(sender);
         try self.mark_warm(address);
+        if (self.world.create_collision(address)) return 0;
         var child_context = context;
         child_context.address = address;
         child_context.call_value = value;
@@ -310,6 +346,79 @@ pub const Vm = struct {
         return self.current().status;
     }
 
+    /// Run every transaction in a block. Caller sets `env.chain_id`. Gas is
+    /// the sum of settled tx gas; the BLOCKHASH window is not updated here.
+    pub fn apply_block(self: *Vm, header: header_mod.Header, txs: []const BlockTx) !u64 {
+        self.bind_block(header);
+        try self.apply_block_system_pre(header);
+        var gas_used: u64 = 0;
+        for (txs) |tx| {
+            try self.apply_block_tx(tx);
+            const next = @addWithOverflow(gas_used, self.tx_gas_used);
+            if (next[1] == 1) return error.BlockGasOverflow;
+            gas_used = next[0];
+        }
+        try self.apply_block_system_post();
+        return gas_used;
+    }
+
+    pub fn push_block_hash(self: *Vm, hash: [32]u8) void {
+        if (self.block_hash_count < limits.block_hashes_max) {
+            self.block_hashes[self.block_hash_count] = hash;
+            self.block_hash_count += 1;
+            return;
+        }
+        var i: u32 = 0;
+        while (i + 1 < limits.block_hashes_max) : (i += 1) {
+            self.block_hashes[i] = self.block_hashes[i + 1];
+        }
+        self.block_hashes[limits.block_hashes_max - 1] = hash;
+    }
+
+    fn bind_block(self: *Vm, header: header_mod.Header) void {
+        self.env.coinbase = header.coinbase;
+        self.env.number = header.number;
+        self.env.timestamp = header.timestamp;
+        self.env.gas_limit = header.gas_limit;
+        self.env.base_fee = header.base_fee;
+        self.env.prev_randao = word.from_bytes_be(&header.prev_randao);
+    }
+
+    fn apply_block_tx(self: *Vm, tx: BlockTx) !void {
+        if (tx.gas_limit == 0) return error.IntrinsicGas;
+        self.access_list = tx.access_list;
+        self.authorizations = tx.authorizations;
+        self.env.gas_price = tx.gas_price;
+        _ = try self.apply_tx(tx.to, tx.data, tx.gas_limit, tx.value, tx.sender);
+    }
+
+    fn apply_block_system_pre(self: *Vm, header: header_mod.Header) !void {
+        try self.system_call(beacon_roots_address, &header.parent_beacon_root);
+        try self.system_call(history_storage_address, &header.parent_hash);
+    }
+
+    fn apply_block_system_post(self: *Vm) !void {
+        try self.system_call(withdrawal_request_address, &[_]u8{});
+        try self.system_call(consolidation_request_address, &[_]u8{});
+    }
+
+    fn system_call(self: *Vm, to: u256, data: []const u8) !void {
+        if (self.world.code_of(to).len == 0) return;
+        const saved_list = self.access_list;
+        const saved_auth = self.authorizations;
+        self.access_list = &.{};
+        self.authorizations = &.{};
+        defer {
+            self.access_list = saved_list;
+            self.authorizations = saved_auth;
+        }
+        var ctx = self.env;
+        ctx.caller = system_address;
+        ctx.origin = system_address;
+        ctx.call_value = 0;
+        _ = self.apply_message(to, data, system_tx_gas, 0, ctx) catch {};
+    }
+
     fn settle_gas(self: *Vm, sender: u256, gas_limit: u64, fees: gas_mod.TxFees, floor: u64) !void {
         std.debug.assert(self.frame_count >= 1);
         const used = gas_mod.settled_gas_used(
@@ -318,6 +427,7 @@ pub const Vm = struct {
             self.gas_refund,
             floor,
         );
+        self.tx_gas_used = used;
         const unused = gas_limit - used;
         try self.world.set_balance(sender, self.world.get_balance(sender) + @as(u256, unused) * fees.effective);
         const tip = @as(u256, used) * fees.priority;
@@ -339,6 +449,7 @@ pub const Vm = struct {
         self.world.transient_count = 0;
         self.created_count = 0;
         self.delete_count = 0;
+        self.tx_gas_used = 0;
     }
 
     fn run_or_fault(self: *Vm) void {
@@ -415,7 +526,7 @@ pub const Vm = struct {
             try self.exec_cheatcode();
             return;
         }
-        if (precompile.is_precompile(frame.code_address) and !frame.disable_precompiles) {
+        if (precompile.is_precompile(frame.code_address, self.fork) and !frame.disable_precompiles) {
             try self.exec_precompile();
             return;
         }
@@ -490,7 +601,7 @@ pub const Vm = struct {
             .blobhash => try exec_blobhash(frame),
             .blobbasefee => try exec_push_const(frame, self.env.blob_base_fee),
             .slotnum => try exec_push_const(frame, self.env.slot_number),
-            .blockhash => try exec_blockhash(frame),
+            .blockhash => try self.exec_blockhash(),
             .pop => try exec_pop(frame),
             .mload => try exec_mload(frame),
             .mstore => try exec_mstore(frame),
@@ -529,6 +640,19 @@ pub const Vm = struct {
             .log4 => try self.exec_log(4),
             else => return error.InvalidOpcode,
         };
+    }
+
+    fn exec_blockhash(self: *Vm) !u32 {
+        const frame = self.current();
+        const wanted = try frame.stack.pop();
+        const hash = header_mod.lookup(
+            &self.block_hashes,
+            self.block_hash_count,
+            self.env.number,
+            wanted,
+        );
+        try frame.stack.push(hash);
+        return frame.pc + 1;
     }
 
     fn exec_sload(self: *Vm) !u32 {
@@ -787,7 +911,7 @@ pub const Vm = struct {
         else
             rlp.create_address(sender, nonce);
         try self.mark_warm(contract);
-        if (self.world.get_nonce(contract) != 0 or self.world.code_of(contract).len != 0) {
+        if (self.world.create_collision(contract)) {
             try self.world.increment_nonce(sender);
             try frame.stack.push(0);
             return frame.pc + 1;
@@ -882,13 +1006,17 @@ pub const Vm = struct {
 
     fn exec_precompile(self: *Vm) !void {
         const frame = self.current();
-        std.debug.assert(precompile.is_precompile(frame.code_address));
-        const input_len: u32 = @intCast(frame.calldata.len);
-        try frame.gas.consume(precompile.gas_cost(frame.code_address, input_len));
+        std.debug.assert(precompile.is_precompile(frame.code_address, self.fork));
+        const cost = precompile.gas_cost(frame.code_address, frame.calldata, self.fork) catch {
+            frame.gas.used = frame.gas.limit;
+            return error.OutOfGas;
+        };
+        try frame.gas.consume(cost);
         self.output_len = try precompile.execute(
             frame.code_address,
             frame.calldata,
             self.output_buffer[0..],
+            self.fork,
         );
         frame.status = .returned;
     }
@@ -942,7 +1070,7 @@ pub const Vm = struct {
         else
             rlp.create_address(sender, nonce);
         self.mark_warm(contract) catch return false;
-        if (self.world.get_nonce(contract) != 0 or self.world.code_of(contract).len != 0) {
+        if (self.world.create_collision(contract)) {
             self.world.increment_nonce(sender) catch return false;
             return false;
         }
@@ -1295,6 +1423,7 @@ pub const Vm = struct {
         while (address <= 10) : (address += 1) {
             try self.mark_warm(address);
         }
+        if (self.fork.at_least(.osaka)) try self.mark_warm(0x100);
     }
 
     fn warm_access_list(self: *Vm) !void {
@@ -1497,7 +1626,7 @@ fn exec_exp(frame: *Frame) !u32 {
     const base = try frame.stack.pop();
     const exponent = try frame.stack.pop();
     const exp_bytes = word.exponent_byte_size(exponent);
-    if (exp_bytes > 0) try frame.gas.consume((exp_bytes - 1) * 50);
+    try frame.gas.consume(exp_bytes * gas_mod.gas_exp_byte);
     try frame.stack.push(word.exp(base, exponent));
     return frame.pc + 1;
 }
@@ -1599,12 +1728,6 @@ fn exec_mcopy(frame: *Frame) !u32 {
 }
 
 fn exec_blobhash(frame: *Frame) !u32 {
-    _ = try frame.stack.pop();
-    try frame.stack.push(0);
-    return frame.pc + 1;
-}
-
-fn exec_blockhash(frame: *Frame) !u32 {
     _ = try frame.stack.pop();
     try frame.stack.push(0);
     return frame.pc + 1;

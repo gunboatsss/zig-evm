@@ -1,0 +1,8 @@
+{
+  "name": "zig-evm",
+  "user": "ubuntu",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "install": "zig build"
+}

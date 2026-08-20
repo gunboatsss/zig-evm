@@ -89,9 +89,21 @@ pub const World = struct {
         return self.code[account.code_off .. account.code_off + account.code_len];
     }
 
+    pub fn has_storage(self: *const World, address: u256) bool {
+        var index: u32 = 0;
+        while (index < self.slot_count) : (index += 1) {
+            if (self.slots[index].address == address and self.slots[index].value != 0) return true;
+        }
+        return false;
+    }
+
     pub fn is_alive(self: *const World, address: u256) bool {
-        const account = self.get_account(address) orelse return false;
-        return account.nonce > 0 or account.balance > 0 or account.code_len > 0;
+        const account = self.get_account(address) orelse return self.has_storage(address);
+        return account.nonce > 0 or account.balance > 0 or account.code_len > 0 or self.has_storage(address);
+    }
+
+    pub fn create_collision(self: *const World, address: u256) bool {
+        return self.get_nonce(address) != 0 or self.code_of(address).len != 0 or self.has_storage(address);
     }
 
     pub fn touch(self: *World, address: u256) !void {
@@ -367,4 +379,12 @@ test "world ether move" {
     try world.move_ether(1, 2, 20);
     try std.testing.expectEqual(@as(u256, 30), world.get_balance(1));
     try std.testing.expectEqual(@as(u256, 20), world.get_balance(2));
+}
+
+test "create collision includes nonempty storage" {
+    var world: World = undefined;
+    world.init();
+    try world.store(9, 1, 1);
+    try std.testing.expect(world.create_collision(9));
+    try std.testing.expect(!world.create_collision(8));
 }

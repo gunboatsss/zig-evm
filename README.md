@@ -19,15 +19,17 @@ zig build test
 
 ## Execution spec tests
 
-Filled [ethereum/execution-spec-tests](https://github.com/ethereum/execution-spec-tests) state fixtures (v5.4.0, Osaka develop set):
+Filled [ethereum/execution-spec-tests](https://github.com/ethereum/execution-spec-tests) fixtures (v5.4.0, Osaka develop set):
 
 ```bash
-scripts/fetch_eest_fixtures.sh          # smoke subset (PUSH0, TSTORE, MCOPY, CLZ)
-scripts/fetch_eest_fixtures.sh --all    # every state_test in the tarball
-zig build jsontest                      # or: zig-evm jsontest tests/eest/state_tests
+scripts/fetch_eest_fixtures.sh                 # every state_test, including EIP-6780
+scripts/fetch_eest_fixtures.sh --smoke         # PUSH0, TSTORE, MCOPY, CLZ, 7702, 6780
+scripts/fetch_eest_fixtures.sh --blockchain    # blockchain_tests (valid Osaka blocks)
+zig build jsontest                             # or: zig-evm jsontest tests/eest/state_tests
+zig build chaintest                            # or: zig-evm chaintest tests/eest/blockchain_tests
 ```
 
-Fixtures live in `tests/eest/` (gitignored). Cases with only a post state-root are skipped; `post.state` is compared account-by-account. Sender and coinbase balances are ignored until gas is charged. `zig build jsontest -Djsontest-path=path` runs a single file or directory.
+Fixtures live in `tests/eest/` (gitignored). `post.state` is compared account-by-account, including sender and coinbase balances. A 32-byte `post.hash` is compared to a check-time Merkle Patricia state root. EIP-6780 is the Osaka `SELFDESTRUCT` rule (same-tx only); Shanghai and earlier posts for those tests are skipped. `zig build jsontest -Djsontest-path=path` runs a single file or directory. `chaintest` applies each valid block (`apply_block`), checks `gasUsed` / `stateRoot`, hashes the header, and pushes it onto the 256-block `BLOCKHASH` window. Invalid blocks, uncles, blobs, and withdrawals are skipped until those paths exist.
 
 ## Architecture
 
@@ -43,7 +45,9 @@ src/
   fork.zig        # osaka baseline, amsterdam additive
   world.zig       # accounts, storage, revert journal
   rlp.zig         # CREATE / CREATE2 addresses
-  interpreter.zig # iterative call stack, depth cap 1024
+  header.zig      # keccak256(rlp(header)) and the BLOCKHASH window
+  trie.zig        # check-time Merkle Patricia state root
+  interpreter.zig # iterative call stack, depth cap 1024, apply_block
   evm.zig         # public execute() API
   main.zig        # CLI
 ```
@@ -54,7 +58,7 @@ The interpreter is a loop over a bounded call stack. Nested calls never recurse 
 
 Opcode metadata follows [`ethereum/execution-specs`](https://github.com/ethereum/execution-specs). **Osaka** is the default (`CLZ`, plus Cancun ops `TLOAD`/`TSTORE`, `MCOPY`, `BLOBHASH`/`BLOBBASEFEE`). **Amsterdam** is opt-in (`--fork amsterdam`) and adds `SLOTNUM` and EIP-8024 `DUPN`/`SWAPN`/`EXCHANGE`. Prague remains selectable as an older fork.
 
-External calls (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`) run on an iterative stack of at most **1025 frames** (`depth + 1 > 1024` is rejected, matching [execution-specs](https://github.com/ethereum/execution-specs)). `LOG0`–`LOG4` and the `ecrecover` precompile (`0x01`) are implemented. Remaining precompiles and `SELFDESTRUCT` are not. `BLOBHASH` returns 0.
+External calls (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`) run on an iterative stack of at most **1025 frames** (`depth + 1 > 1024` is rejected, matching [execution-specs](https://github.com/ethereum/execution-specs)). `LOG0`–`LOG4` and `SELFDESTRUCT` (EIP-6780) are implemented. Precompiles: `ecrecover` (`0x01`), `sha256` (`0x02`), `identity` (`0x04`), `modexp` (`0x05`), and Osaka `p256verify` (`0x100`). `BLOCKHASH` reads a 256-header window of `keccak256(rlp(header))`. `BLOBHASH` returns 0. Frame memory is capped at 16 MiB (shared 128 MiB pool); expansion past that is OutOfGas. State tests compare account dumps and, when `post.hash` is 32 bytes, a check-time Merkle Patricia state root. Blockchain tests run Osaka system contracts (EIP-4788, EIP-2935, EIP-7002, EIP-7251), then check `gasUsed`, `stateRoot`, and the header hash.
 
 ## Tiger Style highlights
 

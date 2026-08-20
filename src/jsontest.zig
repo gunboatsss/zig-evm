@@ -1,11 +1,13 @@
 //! GeneralStateTests / EEST `state_test` JSON runner.
 //!
-//! No Merkle trie: cases with only `post.hash` are skipped. Cases that include
-//! `post.state` (or top-level `postState`) are compared account-by-account.
+//! Account dumps in `post.state` are compared field-by-field. A 32-byte
+//! `post.hash` is compared to a check-time Merkle Patricia state root.
 
 const std = @import("std");
 const evm = @import("evm.zig");
+const header_mod = @import("header.zig");
 const limits = @import("limits.zig");
+const trie_mod = @import("trie.zig");
 const word = @import("u256.zig");
 const world_mod = @import("world.zig");
 
@@ -192,6 +194,12 @@ fn run_named(
         summary.skipped += 1;
         return;
     };
+    if (skip_reason(name, post_key)) |reason| {
+        try writer.print("{s} skip {s}\n", .{ name, reason });
+        try writer.flush();
+        summary.skipped += 1;
+        return;
+    }
     const cases = fixture.post.map.get(post_key).?;
     for (cases) |case| {
         var id_buf: [512]u8 = undefined;
@@ -210,13 +218,71 @@ fn select_post(post: *const std.json.ArrayHashMap([]JsonPostCase), fork: evm.For
     while (it.next()) |kv| {
         const mapped = fixture_fork(kv.key_ptr.*) orelse continue;
         if (!fork.at_least(mapped)) continue;
-        const rank: i32 = if (mapped == fork) 1000 else @intFromEnum(mapped);
+        var rank = network_rank(kv.key_ptr.*) orelse continue;
+        if (mapped == fork) rank += 1000;
         if (rank > best_rank) {
             best_rank = rank;
             best_key = kv.key_ptr.*;
         }
     }
     return best_key;
+}
+
+/// Later network forks win when several post keys map onto the same zig-evm table.
+/// Cancun (EIP-6780) must beat Shanghai (old SELFDESTRUCT).
+fn network_rank(name: []const u8) ?i32 {
+    const forks = [_][]const u8{
+        "frontier", "homestead", "tangerinewhistle", "spuriousdragon", "byzantium",
+        "constantinople", "petersburg", "istanbul", "berlin", "london", "paris", "merge",
+        "shanghai", "cancun", "prague", "osaka", "amsterdam",
+    };
+    for (forks, 0..) |fork_name, index| {
+        if (std.ascii.eqlIgnoreCase(name, fork_name)) return @intCast(index);
+    }
+    return null;
+}
+
+fn is_before(name: []const u8, fork_name: []const u8) bool {
+    const rank = network_rank(name) orelse return false;
+    const bound = network_rank(fork_name) orelse return false;
+    return rank < bound;
+}
+
+fn is_pre_cancun(name: []const u8) bool {
+    return is_before(name, "cancun");
+}
+
+/// Osaka VM vs a post from an older fork whose rule we no longer follow.
+fn skip_reason(test_name: []const u8, post_key: []const u8) ?[]const u8 {
+    if (skip_old_selfdestruct(test_name, post_key)) return "pre-cancun-selfdestruct";
+    if (skip_before_fork(test_name, post_key)) return "before-fork";
+    if (std.mem.indexOf(u8, test_name, "create_one_byte") != null and is_before(post_key, "london")) {
+        return "pre-london-ef";
+    }
+    if (std.mem.indexOf(u8, test_name, "create_deposit_oog") != null and is_before(post_key, "tangerinewhistle")) {
+        return "pre-eip150-create";
+    }
+    if (std.mem.indexOf(u8, test_name, "eip3651") != null and is_before(post_key, "shanghai")) {
+        return "pre-shanghai-warm-coinbase";
+    }
+    if (std.mem.indexOf(u8, test_name, "eip7883") != null and is_before(post_key, "osaka")) {
+        return "pre-osaka-modexp-gas";
+    }
+    return null;
+}
+
+/// EIP-6780 is Osaka SELFDESTRUCT. Pre-Cancun posts expect the old opcode.
+fn skip_old_selfdestruct(test_name: []const u8, post_key: []const u8) bool {
+    if (!is_pre_cancun(post_key)) return false;
+    return std.mem.indexOf(u8, test_name, "eip6780") != null or
+        std.mem.indexOf(u8, test_name, "selfdestruct") != null or
+        std.mem.indexOf(u8, test_name, "SELFDESTRUCT") != null;
+}
+
+/// Osaka implements the opcode; Shanghai posts expect INVALID.
+fn skip_before_fork(test_name: []const u8, post_key: []const u8) bool {
+    if (!is_pre_cancun(post_key)) return false;
+    return std.mem.indexOf(u8, test_name, "before_fork") != null;
 }
 
 fn run_case(
@@ -226,7 +292,9 @@ fn run_case(
     fork: evm.Fork,
 ) !Outcome {
     if (has_exception(case)) return .skip;
-    const state = state_map(&case, fixture) orelse return .skip;
+    const state = state_map(&case, fixture);
+    const want_root = parse_root(case.hash);
+    if (state == null and want_root == null) return .skip;
     const tx = fixture.transaction;
     if (case.indexes.data >= tx.data.len) return .fail;
     if (case.indexes.gas >= tx.gasLimit.len) return .fail;
@@ -236,13 +304,24 @@ fn run_case(
     const gas_limit = try parse_u64(tx.gasLimit[case.indexes.gas]);
     const value = try parse_u256(tx.value[case.indexes.value]);
     if (gas_limit == 0) return .fail;
-    return apply_and_check(allocator, fixture, state, fork, data, gas_limit, value, case.indexes.data);
+    return apply_and_check(
+        allocator,
+        fixture,
+        state,
+        want_root,
+        fork,
+        data,
+        gas_limit,
+        value,
+        case.indexes.data,
+    );
 }
 
 fn apply_and_check(
     allocator: std.mem.Allocator,
     fixture: *const JsonTest,
-    state: *const std.json.ArrayHashMap(JsonAccount),
+    state: ?*const std.json.ArrayHashMap(JsonAccount),
+    want_root: ?[32]u8,
     fork: evm.Fork,
     data: []const u8,
     gas_limit: u64,
@@ -256,6 +335,7 @@ fn apply_and_check(
     vm.world.journal_count = 0;
     const sender = try sender_of(fixture.transaction);
     try bind_env(vm, fixture, sender);
+    try fill_block_hashes(allocator, vm);
     const access = try parse_access_list(allocator, fixture.transaction.accessLists, data_index);
     defer free_access_list(allocator, access);
     vm.access_list = access;
@@ -264,8 +344,38 @@ fn apply_and_check(
     vm.authorizations = auths;
     const to = try call_target(fixture.transaction.to);
     _ = vm.apply_tx(to, data, gas_limit, value, sender) catch return .fail;
-    check_state(&vm.world, state, sender, vm.env.coinbase) catch return .fail;
+    if (state) |expected| {
+        check_state(&vm.world, expected) catch return .fail;
+    }
+    if (want_root) |root| {
+        check_root(allocator, &vm.world, root) catch return .fail;
+    }
     return .pass;
+}
+
+fn fill_block_hashes(allocator: std.mem.Allocator, vm: *evm.Vm) !void {
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    trie.reset();
+    const pre_root = try trie.world_root(&vm.world);
+    vm.block_hash_count = header_mod.fill_window(
+        &vm.block_hashes,
+        vm.env.number,
+        vm.env.coinbase,
+        vm.env.gas_limit,
+        vm.env.timestamp,
+        vm.env.base_fee,
+        vm.env.prev_randao,
+        pre_root,
+    );
+}
+
+fn check_root(allocator: std.mem.Allocator, world: *const world_mod.World, want: [32]u8) !void {
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    trie.reset();
+    const got = try trie.world_root(world);
+    if (!std.mem.eql(u8, &got, &want)) return error.StateRootMismatch;
 }
 
 fn state_map(
@@ -334,12 +444,10 @@ fn bind_env(vm: *evm.Vm, fixture: *const JsonTest, sender: u256) !void {
 fn check_state(
     world: *const world_mod.World,
     expected: *const std.json.ArrayHashMap(JsonAccount),
-    sender: u256,
-    coinbase: u256,
 ) !void {
     var it = expected.map.iterator();
     while (it.next()) |kv| {
-        try check_account(world, kv.key_ptr.*, kv.value_ptr, sender, coinbase);
+        try check_account(world, kv.key_ptr.*, kv.value_ptr);
     }
 }
 
@@ -347,14 +455,10 @@ fn check_account(
     world: *const world_mod.World,
     addr_text: []const u8,
     account: *const JsonAccount,
-    sender: u256,
-    coinbase: u256,
 ) !void {
     const addr = try parse_address(addr_text);
     if (world.get_nonce(addr) != try parse_u64(account.nonce)) return error.NonceMismatch;
-    // Fee accounts: other opcodes still have inexact gas (CALL extras, MCOPY, …).
-    const fee_account = addr == sender or addr == coinbase;
-    if (!fee_account and world.get_balance(addr) != try parse_u256(account.balance)) {
+    if (world.get_balance(addr) != try parse_u256(account.balance)) {
         return error.BalanceMismatch;
     }
     var code_buf: [limits.code_bytes_max]u8 = undefined;
@@ -539,6 +643,14 @@ fn parse_hex_alloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return out;
 }
 
+fn parse_root(text: []const u8) ?[32]u8 {
+    const hex = strip0x(text);
+    if (hex.len != 64) return null;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch return null;
+    return out;
+}
+
 fn parse_hex_into(text: []const u8, out: []u8) !u32 {
     const trimmed = strip0x(text);
     if (trimmed.len % 2 != 0) return error.InvalidHex;
@@ -611,6 +723,27 @@ test "osaka-only fixture skips on prague" {
     const summary = try with_writer(json, .prague);
     try std.testing.expectEqual(@as(u32, 1), summary.skipped);
     try std.testing.expectEqual(@as(u32, 0), summary.passed);
+}
+
+test "eip6780 prefers cancun over shanghai and skips pre-cancun posts" {
+    try std.testing.expect(network_rank("cancun").? > network_rank("shanghai").?);
+    try std.testing.expect(is_pre_cancun("Shanghai"));
+    try std.testing.expect(!is_pre_cancun("Cancun"));
+    try std.testing.expect(!is_pre_cancun("Osaka"));
+    try std.testing.expect(skip_old_selfdestruct("eip6780_selfdestruct_pre_existing", "Shanghai"));
+    try std.testing.expect(!skip_old_selfdestruct("eip6780_selfdestruct_pre_existing", "Osaka"));
+    try std.testing.expect(!skip_old_selfdestruct("eip3855_push0", "Shanghai"));
+    try std.testing.expect(skip_before_fork("test_blobbasefee_before_fork", "Shanghai"));
+    try std.testing.expect(!skip_before_fork("test_blobbasefee_before_fork", "Cancun"));
+    try std.testing.expect(!skip_before_fork("test_blobbasefee_out_of_gas", "Shanghai"));
+    try std.testing.expectEqualStrings("pre-london-ef", skip_reason("create_one_byte", "Istanbul").?);
+    try std.testing.expect(skip_reason("create_one_byte", "London") == null);
+    try std.testing.expectEqualStrings("pre-eip150-create", skip_reason("create_deposit_oog", "Frontier").?);
+    try std.testing.expect(skip_reason("create_deposit_oog", "Berlin") == null);
+    try std.testing.expectEqualStrings("pre-shanghai-warm-coinbase", skip_reason("eip3651_warm_coinbase", "Paris").?);
+    try std.testing.expect(skip_reason("eip3651_warm_coinbase", "Shanghai") == null);
+    try std.testing.expectEqualStrings("pre-osaka-modexp-gas", skip_reason("eip7883_modexp_gas_increase", "Prague").?);
+    try std.testing.expect(skip_reason("eip7883_modexp_gas_increase", "Osaka") == null);
 }
 
 test "wrong storage fails" {
