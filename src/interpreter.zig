@@ -21,6 +21,7 @@ pub const Status = enum {
     returned,
     reverted,
     faulted,
+    breakpoint,
 };
 
 const CallKind = enum {
@@ -463,6 +464,10 @@ pub const Vm = struct {
         std.debug.assert(self.frame_count == 1);
         while (true) {
             const frame = self.current();
+            if (frame.status == .breakpoint) {
+                if (self.trace) |tr| tr.paused = true;
+                return;
+            }
             if (frame.status != .running) {
                 if (self.frame_count == 1) {
                     self.finish_top();
@@ -538,6 +543,10 @@ pub const Vm = struct {
         const opcode_byte = frame.code[frame.pc];
         const opcode = opcode_mod.Opcode.from_byte(opcode_byte);
         if (!opcode_mod.Opcode.enabled(opcode, self.fork)) return error.InvalidOpcode;
+        if (opcode == .breakpoint) {
+            frame.status = .breakpoint;
+            return;
+        }
         try frame.gas.consume(opcode_mod.Opcode.static_gas(opcode));
         const next_pc = try self.execute(opcode);
         std.debug.assert(next_pc <= frame.code.len);

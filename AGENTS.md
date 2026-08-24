@@ -27,7 +27,9 @@ spec tests) and `build.zig`.
   the repo, not caused by a fresh setup — do not treat it as a regression.
 - Run bytecode: `./zig-out/bin/zig-evm run 0x<bytecode> [0x<calldata>]`.
 - LLM trace/debugger: `./zig-out/bin/zig-evm debug 0x<bytecode> <cmd>` (see
-  `.cursor/skills/zig-evm-debug/SKILL.md`).
+  `.cursor/skills/zig-evm-debug/SKILL.md`). `0xCC` is zig-evm `BREAKPOINT`:
+  opt in with `--fork osaka_breakpoint` (or `prague_breakpoint` /
+  `amsterdam_breakpoint`). Prague / Osaka / Amsterdam still treat it as invalid.
 
 ### Execution-spec (EEST) tests — gotchas
 

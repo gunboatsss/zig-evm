@@ -933,7 +933,9 @@ fn explain_info(byte: u8) Explain {
         0xf5 => make_explain("call", "Create a contract with salt", &.{ "value", "offset", "size", "salt" }),
         0xfa => make_explain("call", "Static call", &.{ "gas", "address", "in_offset", "in_size", "out_offset", "out_size" }),
         0xfd => make_explain("halt", "Revert with output data", &.{ "offset", "size" }),
+        0xfe => make_explain("halt", "Invalid opcode", &.{}),
         0xff => make_explain("halt", "Self-destruct", &.{"beneficiary"}),
+        0xcc => make_explain("halt", "Pause at this PC for the zig-evm debugger", &.{}),
         else => make_explain("other", "Execute opcode", &.{}),
     };
 }
@@ -1085,6 +1087,46 @@ test "debug overview and opcode json" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"global_step\":3") != null);
 }
 
+test "debug breakpoint halts at 0xcc" {
+    const code = [_]u8{ 0x60, 0x01, 0xcc };
+    const allocator = std.testing.allocator;
+    var session = try Session.init_bytecode(allocator, &code, &.{}, 1_000_000, .osaka_breakpoint);
+    defer session.deinit();
+    try std.testing.expectEqual(interpreter.Status.breakpoint, session.vm.current().status);
+    try std.testing.expectEqual(@as(u32, 2), session.vm.current().pc);
+    try std.testing.expectEqual(@as(u32, 1), session.vm.current().stack.depth);
+    try std.testing.expectEqual(@as(u256, 1), try session.vm.current().stack.peek(0));
+    try std.testing.expect(session.trace.paused);
+    try std.testing.expectEqual(@as(u32, 2), session.trace.step_count);
+    try std.testing.expectEqual(@as(u8, 0xcc), session.trace.steps[1].opcode);
+    try std.testing.expect(session.run_error == null);
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try run_query(allocator, &code, &.{}, 1_000_000, .osaka_breakpoint, "opcode", .{ .opcode = "BREAKPOINT" }, &writer);
+    const named = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, named, "\"opcode\":\"BREAKPOINT\"") != null);
+
+    writer = std.Io.Writer.fixed(&buf);
+    try run_query(allocator, &code, &.{}, 1_000_000, .osaka_breakpoint, "opcode", .{ .opcode = "0xcc" }, &writer);
+    const hexed = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, hexed, "\"opcode\":\"BREAKPOINT\"") != null);
+
+    writer = std.Io.Writer.fixed(&buf);
+    try run_query(allocator, &code, &.{}, 1_000_000, .osaka_breakpoint, "overview", .{}, &writer);
+    const overview = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, overview, "\"status\":\"breakpoint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overview, "\"paused\":true") != null);
+}
+
+test "debug osaka still faults on 0xcc" {
+    const code = [_]u8{ 0x60, 0x01, 0xcc };
+    const allocator = std.testing.allocator;
+    var session = try Session.init_bytecode(allocator, &code, &.{}, 1_000_000, .osaka);
+    defer session.deinit();
+    try std.testing.expectEqualStrings("InvalidOpcode", session.run_error.?);
+}
+
 test "debug sstore storage-diff" {
     const code = [_]u8{ 0x60, 0x01, 0x60, 0x00, 0x55, 0x00 };
     var buf: [4096]u8 = undefined;
@@ -1133,4 +1175,38 @@ test "debug forge traces setUp then the test call" {
     defer replay.deinit();
     try std.testing.expectEqual(@as(u256, 3), try replay.vm.current().stack.peek(0));
     try std.testing.expectEqual(@as(u256, 2), try replay.vm.current().stack.peek(1));
+}
+
+test "debug forge breakpoint with osaka_breakpoint" {
+    const allocator = std.testing.allocator;
+    const runtime = [_]u8{ 0x60, 0x01, 0xcc };
+    var buf: [32]u8 = undefined;
+    const init_code = forge_test.wrap_runtime(&runtime, &buf);
+    const bytecode = try allocator.dupe(u8, init_code);
+    const name = try allocator.dupe(u8, "testBreak");
+    const cases = try allocator.alloc(forge_test.Case, 1);
+    cases[0] = .{
+        .name = name,
+        .selector = forge_test.selector_of("testBreak()"),
+        .kind = .unit,
+    };
+    const contract = try allocator.dupe(u8, "Break.t.sol");
+    var matched = forge_test.MatchedTest{
+        .suite = .{
+            .bytecode = bytecode,
+            .setup = null,
+            .failed = null,
+            .cases = cases,
+        },
+        .case_index = 0,
+        .contract = contract,
+        .allocator = allocator,
+    };
+    defer matched.deinit();
+    var session = try Session.init_forge(allocator, &matched, .osaka_breakpoint, null);
+    defer session.deinit();
+    try std.testing.expectEqual(interpreter.Status.breakpoint, session.vm.current().status);
+    try std.testing.expect(session.trace.paused);
+    try std.testing.expectEqual(@as(u8, 0xcc), session.trace.steps[session.trace.step_count - 1].opcode);
+    try std.testing.expect(session.run_error == null);
 }

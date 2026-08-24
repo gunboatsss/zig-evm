@@ -162,6 +162,38 @@ test "osaka rejects slotnum" {
     try std.testing.expectError(error.InvalidOpcode, result);
 }
 
+test "plain execute treats breakpoint as invalid" {
+    const code = [_]u8{ 0x60, 0x01, 0xcc };
+    const result = execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectError(error.InvalidOpcode, result);
+}
+
+test "osaka_breakpoint halt at 0xcc" {
+    const code = [_]u8{ 0x60, 0x01, 0xcc };
+    const result = try execute_with_fork(
+        std.testing.allocator,
+        &code,
+        &[_]u8{},
+        1_000_000,
+        ExecutionContext.default(),
+        .osaka_breakpoint,
+    );
+    try std.testing.expectEqual(Status.breakpoint, result.status);
+}
+
+test "prague_breakpoint does not enable clz" {
+    const code = [_]u8{ 0x60, 0x01, 0x1e, 0x00 };
+    const result = execute_with_fork(
+        std.testing.allocator,
+        &code,
+        &[_]u8{},
+        1_000_000,
+        ExecutionContext.default(),
+        .prague_breakpoint,
+    );
+    try std.testing.expectError(error.InvalidOpcode, result);
+}
+
 test "amsterdam slotnum" {
     const code = [_]u8{ 0x4b, 0x00 };
     const result = try execute_with_fork(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default(), .amsterdam);

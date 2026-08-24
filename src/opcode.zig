@@ -1,5 +1,6 @@
 //! Opcode table for Osaka (baseline) and Amsterdam (additive).
 //! Byte values match `ethereum/execution-specs` `forks/osaka` and `forks/amsterdam`.
+//! `BREAKPOINT` (`0xcc`) is zig-evm only: enabled on `*_breakpoint` forks.
 
 const std = @import("std");
 const fork_mod = @import("fork.zig");
@@ -105,6 +106,8 @@ pub const Opcode = enum(u8) {
     log2 = 0xa2,
     log3 = 0xa3,
     log4 = 0xa4,
+    /// zig-evm debug halt. Not a Yellow Paper opcode; `*_breakpoint` forks only.
+    breakpoint = 0xcc,
     dupn = 0xe6,
     swapn = 0xe7,
     exchange = 0xe8,
@@ -160,7 +163,7 @@ pub const Opcode = enum(u8) {
 
     pub fn is_terminal(opcode: Opcode) bool {
         return switch (opcode) {
-            .stop, .return_, .revert, .selfdestruct => true,
+            .stop, .return_, .revert, .selfdestruct, .breakpoint => true,
             else => false,
         };
     }
@@ -175,6 +178,7 @@ pub const Opcode = enum(u8) {
     }
 
     pub fn enabled(opcode: Opcode, fork: Fork) bool {
+        if (opcode == .breakpoint) return fork.has_breakpoint();
         return fork.at_least(introduced_in(opcode));
     }
 
@@ -261,6 +265,7 @@ pub const Opcode = enum(u8) {
             0xa2 => "LOG2",
             0xa3 => "LOG3",
             0xa4 => "LOG4",
+            0xcc => "BREAKPOINT",
             0xe6 => "DUPN",
             0xe7 => "SWAPN",
             0xe8 => "EXCHANGE",
@@ -285,7 +290,7 @@ pub const Opcode = enum(u8) {
         if (raw >= 0x80 and raw <= 0x8f) return gas_very_low;
         if (raw >= 0x90 and raw <= 0x9f) return gas_very_low;
         return switch (opcode) {
-            .stop, .invalid, .return_, .revert => 0,
+            .stop, .invalid, .return_, .revert, .breakpoint => 0,
             .jumpdest => gas_jumpdest,
             .pop, .pc, .msize, .gas, .address, .origin, .caller, .callvalue, .calldatasize, .codesize, .gasprice, .coinbase, .timestamp, .number, .prevrandao, .gaslimit, .chainid, .basefee, .blobbasefee, .slotnum, .push0, .returndatasize => gas_base,
             .add, .sub, .not_, .lt, .gt, .slt, .sgt, .eq, .iszero_, .and_, .or_, .xor, .byte, .shl, .shr, .sar, .calldataload, .mload, .mstore, .mstore8, .calldatacopy, .codecopy, .returndatacopy, .mcopy, .dupn, .swapn, .exchange, .blobhash => gas_very_low,
@@ -390,6 +395,20 @@ test "mnemonic covers families and named ops" {
     try std.testing.expectEqualStrings("SWAP16", Opcode.mnemonic(0x9f));
     try std.testing.expectEqualStrings("CLZ", Opcode.mnemonic(0x1e));
     try std.testing.expectEqualStrings("INVALID", Opcode.mnemonic(0x0c));
+    try std.testing.expectEqualStrings("BREAKPOINT", Opcode.mnemonic(0xcc));
+}
+
+test "breakpoint is opt-in via *_breakpoint forks" {
+    try std.testing.expect(!Opcode.enabled(.breakpoint, .prague));
+    try std.testing.expect(!Opcode.enabled(.breakpoint, .osaka));
+    try std.testing.expect(!Opcode.enabled(.breakpoint, .amsterdam));
+    try std.testing.expect(Opcode.enabled(.breakpoint, .prague_breakpoint));
+    try std.testing.expect(Opcode.enabled(.breakpoint, .osaka_breakpoint));
+    try std.testing.expect(Opcode.enabled(.breakpoint, .amsterdam_breakpoint));
+    try std.testing.expect(!Opcode.enabled(.clz, .prague_breakpoint));
+    try std.testing.expect(Opcode.enabled(.clz, .osaka_breakpoint));
+    try std.testing.expectEqual(@as(u64, 0), Opcode.static_gas(.breakpoint));
+    try std.testing.expect(Opcode.is_terminal(.breakpoint));
 }
 
 test "clz is osaka, slotnum is amsterdam" {

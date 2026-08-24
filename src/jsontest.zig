@@ -219,7 +219,7 @@ fn select_post(post: *const std.json.ArrayHashMap([]JsonPostCase), fork: evm.For
         const mapped = fixture_fork(kv.key_ptr.*) orelse continue;
         if (!fork.at_least(mapped)) continue;
         var rank = network_rank(kv.key_ptr.*) orelse continue;
-        if (mapped == fork) rank += 1000;
+        if (mapped.spec() == fork.spec()) rank += 1000;
         if (rank > best_rank) {
             best_rank = rank;
             best_key = kv.key_ptr.*;

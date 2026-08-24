@@ -76,10 +76,10 @@ pub fn main(init: std.process.Init) !void {
 fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
     try writer.print(
         \\Usage:
-        \\  {s} run [--fork prague|osaka|amsterdam] <hex-bytecode> [hex-calldata]
-        \\  {s} debug [--fork prague|osaka|amsterdam] [--gas N] <hex-bytecode> [hex-calldata] <cmd> [k=v...]
-        \\  {s} debug [--fork prague|osaka|amsterdam] --match-test <name> [--match-contract <name>] [out-dir] <cmd> [k=v...]
-        \\  {s} forge-test [--fork prague|osaka|amsterdam] [out-dir]
+        \\  {s} run [--fork prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] <hex-bytecode> [hex-calldata]
+        \\  {s} debug [--fork prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] [--gas N] <hex-bytecode> [hex-calldata] <cmd> [k=v...]
+        \\  {s} debug [--fork prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] --match-test <name> [--match-contract <name>] [out-dir] <cmd> [k=v...]
+        \\  {s} forge-test [--fork prague|osaka|amsterdam|osaka_breakpoint] [out-dir]
         \\  {s} jsontest [--fork prague|osaka|amsterdam] [file-or-dir]
         \\  {s} chaintest [--fork prague|osaka|amsterdam] [file-or-dir]
         \\  {s} test-bytecode
@@ -87,6 +87,8 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\Default fork is osaka. `run` is a plain EVM (no hevm cheatcodes).
         \\`debug` prints JSON for LLM traces: overview, state, step, pc, opcode,
         \\call-tree, storage-diff, explain, trace, diff.
+        \\`0xcc` is BREAKPOINT only on `prague_breakpoint` / `osaka_breakpoint` /
+        \\`amsterdam_breakpoint`. Prague, Osaka, and Amsterdam treat it as invalid.
         \\`--match-test` loads a `forge-test` artifact and traces setUp plus the
         \\test call with hevm cheatcodes (constructor is omitted). Default dir is `out`.
         \\`forge-test` enables Foundry cheatcodes at 0x7109… and runs `test*`
@@ -103,14 +105,15 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\  {s} run 0x60011e00
         \\  {s} debug 0x600160020100 overview
         \\  {s} debug 0x600160020100 state step=3
-        \\  {s} debug --match-test testFoo overview
+        \\  {s} debug --fork osaka_breakpoint 0x6001cc opcode opcode=BREAKPOINT
+        \\  {s} debug --fork osaka_breakpoint --match-test testFoo overview
         \\  {s} forge-test out
         \\  {s} jsontest
         \\  {s} chaintest
         \\
     , .{
         program, program, program, program, program, program, program,
-        program, program, program, program, program, program, program,
+        program, program, program, program, program, program, program, program,
     });
 }
 

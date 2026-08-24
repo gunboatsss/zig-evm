@@ -435,6 +435,17 @@ test "run reverting test fails" {
     try std.testing.expectEqual(Outcome.fail, outcome);
 }
 
+test "forge-test breakpoint is not a pass" {
+    const runtime = [_]u8{ 0xcc };
+    var buf: [16]u8 = undefined;
+    const init_code = wrap_runtime(&runtime, &buf);
+    const case = Case{ .name = "testBreak", .selector = selector_of("testBreak()"), .kind = .unit };
+    const halted = try run_case(std.testing.allocator, init_code, case, null, null, .osaka_breakpoint, null);
+    try std.testing.expectEqual(Outcome.fail, halted);
+    const invalid = try run_case(std.testing.allocator, init_code, case, null, null, .osaka, null);
+    try std.testing.expectEqual(Outcome.fail, invalid);
+}
+
 test "testFail passes on revert" {
     const runtime = [_]u8{ 0x60, 0x00, 0x60, 0x00, 0xfd };
     var buf: [20]u8 = undefined;
