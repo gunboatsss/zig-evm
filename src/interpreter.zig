@@ -89,6 +89,11 @@ pub const BlockTx = struct {
     max_fee_per_blob_gas: u256 = 0,
 };
 
+pub const Withdrawal = struct {
+    address: u256,
+    amount_gwei: u256,
+};
+
 /// EIP-4788 / EIP-2935 / EIP-7002 / EIP-7251 system caller.
 const system_address: u256 = 0xfffffffffffffffffffffffffffffffffffffffe;
 const beacon_roots_address: u256 = 0x000F3dF6D732807EF1319Fb7B8BB8522d0BEAC02;
@@ -360,9 +365,15 @@ pub const Vm = struct {
         return self.current().status;
     }
 
-    /// Run every transaction in a block. Caller sets `env.chain_id`. Gas is
-    /// the sum of settled tx gas; the BLOCKHASH window is not updated here.
-    pub fn apply_block(self: *Vm, header: header_mod.Header, txs: []const BlockTx) !u64 {
+    /// Run every transaction in a block, then credit EIP-4895 withdrawals.
+    /// Caller sets `env.chain_id`. Gas is the sum of settled tx gas; the
+    /// BLOCKHASH window is not updated here.
+    pub fn apply_block(
+        self: *Vm,
+        header: header_mod.Header,
+        txs: []const BlockTx,
+        withdrawals: []const Withdrawal,
+    ) !u64 {
         self.bind_block(header);
         try self.apply_block_system_pre(header);
         var gas_used: u64 = 0;
@@ -378,6 +389,7 @@ pub const Vm = struct {
             if (blob_gas_used > gas_mod.blob_gas_per_block_max()) return error.BlobGasLimit;
         }
         if (@as(u256, blob_gas_used) != header.blob_gas_used) return error.BlobGasUsedMismatch;
+        try self.apply_withdrawals(withdrawals);
         try self.apply_block_system_post();
         return gas_used;
     }
@@ -414,6 +426,16 @@ pub const Vm = struct {
         self.max_fee_per_blob_gas = tx.max_fee_per_blob_gas;
         self.env.gas_price = tx.gas_price;
         _ = try self.apply_tx(tx.to, tx.data, tx.gas_limit, tx.value, tx.sender);
+    }
+
+    fn apply_withdrawals(self: *Vm, withdrawals: []const Withdrawal) !void {
+        std.debug.assert(withdrawals.len <= limits.withdrawals_max);
+        const gwei: u256 = 1_000_000_000;
+        for (withdrawals) |w| {
+            const product = @mulWithOverflow(w.amount_gwei, gwei);
+            std.debug.assert(product[1] == 0);
+            try self.world.set_balance(w.address, self.world.get_balance(w.address) + product[0]);
+        }
     }
 
     fn apply_block_system_pre(self: *Vm, header: header_mod.Header) !void {
@@ -1494,7 +1516,7 @@ pub const Vm = struct {
 
     fn warm_precompiles(self: *Vm) !void {
         var address: u256 = 1;
-        while (address <= 10) : (address += 1) {
+        while (address <= 17) : (address += 1) {
             try self.mark_warm(address);
         }
         if (self.fork.at_least(.osaka)) try self.mark_warm(0x100);

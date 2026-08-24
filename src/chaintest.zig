@@ -1,7 +1,7 @@
 //! EEST `blockchain_tests` JSON runner.
 //!
-//! Valid Osaka blocks first: skip `expectException`, uncles, and
-//! withdrawals. Transaction / receipt tries are copied from the fixture so
+//! Valid Osaka blocks first: skip `expectException` and uncles.
+//! Transaction / receipt tries are copied from the fixture so
 //! header hashing still matches when `stateRoot` and `gasUsed` are right.
 
 const std = @import("std");
@@ -96,6 +96,9 @@ const JsonTx = struct {
 
 const JsonWithdrawal = struct {
     index: []const u8 = "0x00",
+    validatorIndex: []const u8 = "0x00",
+    address: []const u8 = "",
+    amount: []const u8 = "0x00",
 };
 
 const JsonBlock = struct {
@@ -237,9 +240,6 @@ fn skip_reason(name: []const u8, fixture: *const JsonFixture, fork: evm.Fork) ?[
         if (has_exception(block.expectException)) return "expect-exception";
         if (block.blockHeader == null) return "undecoded-block";
         if (block.uncleHeaders.len != 0) return "uncles";
-        if (block.withdrawals) |w| {
-            if (w.len != 0) return "withdrawals";
-        }
         if (unsupported_header(block.blockHeader.?)) |why| return why;
     }
     if (unsupported_header(fixture.genesisBlockHeader)) |why| return why;
@@ -273,7 +273,7 @@ fn run_case(allocator: std.mem.Allocator, fixture: *const JsonFixture, fork: evm
 
     var head = genesis_hash;
     for (fixture.blocks) |block| {
-        head = try apply_fixture_block(allocator, vm, block.blockHeader.?, block.transactions);
+        head = try apply_fixture_block(allocator, vm, block.blockHeader.?, block.transactions, block.withdrawals);
     }
     try check_header_hash(fixture.lastblockhash, head);
     if (fixture.postState) |state| {
@@ -290,12 +290,15 @@ fn apply_fixture_block(
     vm: *evm.Vm,
     json_header: JsonHeader,
     json_txs: []const JsonTx,
+    json_withdrawals: ?[]const JsonWithdrawal,
 ) ![32]u8 {
     var extra: [limits.header_extra_bytes_max]u8 = undefined;
     const header = try decode_header(json_header, &extra);
     const txs = try parse_txs(allocator, json_txs, header.base_fee);
     defer free_txs(allocator, txs);
-    const gas_used = try vm.apply_block(header, txs);
+    const withdrawals = try parse_withdrawals(allocator, json_withdrawals);
+    defer if (withdrawals.len != 0) allocator.free(withdrawals);
+    const gas_used = try vm.apply_block(header, txs, withdrawals);
     if (header.gas_used != 0 and @as(u256, gas_used) != header.gas_used) {
         return error.GasUsedMismatch;
     }
@@ -343,6 +346,21 @@ fn parse_tx(allocator: std.mem.Allocator, json_tx: JsonTx, base_fee: u256) !evm.
         .blob_versioned_hashes = blobs,
         .max_fee_per_blob_gas = try parse_u256(json_tx.maxFeePerBlobGas),
     };
+}
+
+fn parse_withdrawals(allocator: std.mem.Allocator, json_w: ?[]const JsonWithdrawal) ![]evm.Withdrawal {
+    const items = json_w orelse return &.{};
+    if (items.len == 0) return &.{};
+    if (items.len > limits.withdrawals_max) return error.WithdrawalLimit;
+    const out = try allocator.alloc(evm.Withdrawal, items.len);
+    errdefer allocator.free(out);
+    for (items, 0..) |item, index| {
+        out[index] = .{
+            .address = try parse_address(item.address),
+            .amount_gwei = try parse_u256(item.amount),
+        };
+    }
+    return out;
 }
 
 fn parse_blob_hashes(allocator: std.mem.Allocator, hashes: []const []const u8) ![][32]u8 {

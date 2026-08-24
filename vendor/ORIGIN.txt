@@ -8,5 +8,6 @@ blst
   commit e7f90de551e8df682f3cc99067d204d8b90d27ad
   Apache-2.0
 
-POINT_EVALUATION uses this C library until a Tiger Style Zig rewrite exists.
-Only the files the EVM compile needs are copied (no tests, Go, Rust, or Windows asm).
+POINT_EVALUATION and BLS12-381 precompiles use this C library until a Tiger
+Style Zig rewrite exists. Only the files the EVM compile needs are copied
+(no tests, Go, Rust, or Windows asm).

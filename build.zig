@@ -19,13 +19,21 @@ pub fn build(b: *std.Build) void {
     ckzg_c.addIncludePath(b.path("vendor/blst/bindings"));
     const ckzg_c_mod = ckzg_c.createModule();
 
+    const blst_c = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/blst/bindings/blst.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const blst_c_mod = blst_c.createModule();
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    add_ckzg(b, root_module, target, ckzg_c_mod, setup_mod);
+    add_ckzg(b, root_module, target, ckzg_c_mod, setup_mod, blst_c_mod);
 
     const exe = b.addExecutable(.{
         .name = "zig-evm",
@@ -39,7 +47,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    add_ckzg(b, test_module, target, ckzg_c_mod, setup_mod);
+    add_ckzg(b, test_module, target, ckzg_c_mod, setup_mod, blst_c_mod);
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,
@@ -74,8 +82,10 @@ fn add_ckzg(
     target: std.Build.ResolvedTarget,
     ckzg_c_mod: *std.Build.Module,
     setup_mod: *std.Build.Module,
+    blst_c_mod: *std.Build.Module,
 ) void {
     mod.addImport("ckzg_c", ckzg_c_mod);
+    mod.addImport("blst_c", blst_c_mod);
     mod.addImport("kzg_trusted_setup_txt", setup_mod);
     mod.addIncludePath(b.path("vendor/c-kzg-4844/src"));
     mod.addIncludePath(b.path("vendor/blst/bindings"));

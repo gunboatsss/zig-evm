@@ -67,6 +67,20 @@ pub const gas_per_blob: u64 = 1 << 17;
 pub const blob_base_fee_update_fraction: u256 = 5_007_716;
 /// EIP-4844 `POINT_EVALUATION`.
 pub const gas_kzg_point_evaluation: u64 = 50_000;
+/// EIP-196/1108 alt_bn128.
+pub const gas_bn254_add: u64 = 150;
+pub const gas_bn254_mul: u64 = 6000;
+pub const gas_bn254_pairing_base: u64 = 45_000;
+pub const gas_bn254_pairing_pair: u64 = 34_000;
+/// EIP-2537 BLS12-381 (Prague).
+pub const gas_bls_g1add: u64 = 375;
+pub const gas_bls_g1mul: u64 = 12_000;
+pub const gas_bls_g1map: u64 = 5_500;
+pub const gas_bls_g2add: u64 = 600;
+pub const gas_bls_g2mul: u64 = 22_500;
+pub const gas_bls_g2map: u64 = 23_800;
+pub const gas_bls_pairing_base: u64 = 37_700;
+pub const gas_bls_pairing_pair: u64 = 32_600;
 /// EIP-7951 `P256VERIFY`.
 pub const gas_p256verify: u64 = 6900;
 pub const gas_log_data: u64 = 8;

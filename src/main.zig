@@ -98,7 +98,7 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\A 32-byte post.hash is the Merkle Patricia state root. EIP-6780 is
         \\included (Osaka SELFDESTRUCT); pre-Cancun posts for it are skipped.
         \\`chaintest` runs EEST blockchain_tests (valid blocks: skip exceptions,
-        \\uncles, withdrawals). Fetch with
+        \\uncles). Fetch with
         \\scripts/fetch_eest_fixtures.sh --blockchain.
         \\
         \\Examples:

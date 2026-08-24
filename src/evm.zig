@@ -17,6 +17,7 @@ pub const Vm = interpreter.Vm;
 pub const AccessListItem = interpreter.AccessListItem;
 pub const Authorization = interpreter.Authorization;
 pub const BlockTx = interpreter.BlockTx;
+pub const Withdrawal = interpreter.Withdrawal;
 
 pub const Result = struct {
     status: Status,
@@ -1089,7 +1090,7 @@ test "apply_block runs a tx and BLOCKHASH sees the parent" {
         .sender = 1,
         .gas_price = 1,
     }};
-    const gas_used = try vm.apply_block(block, &txs);
+    const gas_used = try vm.apply_block(block, &txs, &.{});
     try std.testing.expect(gas_used >= 21_000);
     try std.testing.expectEqual(@as(u32, 32), vm.output_len);
     try std.testing.expectEqualSlices(u8, &genesis_hash, vm.output_buffer[0..32]);
@@ -1123,7 +1124,7 @@ test "apply_block blob gas matches the header" {
         .blob_versioned_hashes = &hashes,
         .max_fee_per_blob_gas = 1,
     }};
-    const gas_used = try vm.apply_block(block, &txs);
+    const gas_used = try vm.apply_block(block, &txs, &.{});
     try std.testing.expectEqual(@as(u64, 21_000), gas_used);
     try std.testing.expectEqual(@as(u256, 1), vm.env.blob_base_fee);
     try std.testing.expectEqual(@as(u256, 131_072), vm.world.get_balance(1));
@@ -1151,7 +1152,7 @@ test "apply_block blob gas used must match the header" {
         .sender = 1,
         .gas_price = 0,
     }};
-    try std.testing.expectError(error.BlobGasUsedMismatch, vm.apply_block(block, &txs));
+    try std.testing.expectError(error.BlobGasUsedMismatch, vm.apply_block(block, &txs, &.{}));
 }
 
 test "apply_block sets blob base fee from excess blob gas" {
@@ -1168,8 +1169,28 @@ test "apply_block sets blob base fee from excess blob gas" {
         .withdrawals_root = trie_mod.empty_root,
         .excess_blob_gas = gas_mod.blob_base_fee_update_fraction,
     };
-    _ = try vm.apply_block(block, &.{});
+    _ = try vm.apply_block(block, &.{}, &.{});
     try std.testing.expectEqual(@as(u256, 2), vm.env.blob_base_fee);
+}
+
+test "apply_block credits withdrawals in gwei" {
+    const header_mod = @import("header.zig");
+    const trie_mod = @import("trie.zig");
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const block = header_mod.Header{
+        .number = 1,
+        .gas_limit = 30_000_000,
+        .timestamp = 2,
+        .withdrawals_root = trie_mod.empty_root,
+    };
+    const withdrawals = [_]Withdrawal{.{
+        .address = 0xaa,
+        .amount_gwei = 3,
+    }};
+    _ = try vm.apply_block(block, &.{}, &withdrawals);
+    try std.testing.expectEqual(@as(u256, 3_000_000_000), vm.world.get_balance(0xaa));
 }
 
 test "push_block_hash keeps a 256-window" {

@@ -1,6 +1,4 @@
-//! Precompiles. `0x01` ecrecover, `0x02` sha256, `0x03` ripemd160, `0x04` identity,
-//! `0x05` modexp, `0x09` blake2f, `0x0a` point evaluation, `0x100` p256verify (Osaka).
-//! Others stay empty accounts.
+//! Precompiles. `0x01` ecrecover through `0x11` BLS12-381, plus Osaka `0x100` p256verify.
 
 const std = @import("std");
 const gas_mod = @import("gas.zig");
@@ -11,6 +9,8 @@ const modexp = @import("modexp.zig");
 const ripemd160 = @import("ripemd160.zig");
 const blake2f = @import("blake2f.zig");
 const kzg = @import("kzg.zig");
+const bn254 = @import("bn254.zig");
+const bls12 = @import("bls12.zig");
 
 const Curve = std.crypto.ecc.Secp256k1;
 const secp256k1n: u256 = Curve.scalar.field_order;
@@ -22,16 +22,22 @@ pub const sha256_address: u256 = 2;
 pub const ripemd160_address: u256 = 3;
 pub const identity_address: u256 = 4;
 pub const modexp_address: u256 = 5;
+pub const bn254_add_address: u256 = 6;
+pub const bn254_mul_address: u256 = 7;
+pub const bn254_pairing_address: u256 = 8;
 pub const blake2f_address: u256 = 9;
 pub const kzg_address: u256 = 10;
+pub const bls_g1_add_address: u256 = 11;
+pub const bls_g1_msm_address: u256 = 12;
+pub const bls_g2_add_address: u256 = 13;
+pub const bls_g2_msm_address: u256 = 14;
+pub const bls_pairing_address: u256 = 15;
+pub const bls_map_g1_address: u256 = 16;
+pub const bls_map_g2_address: u256 = 17;
 pub const p256verify_address: u256 = 0x100;
 
 pub fn is_precompile(address: u256, fork: Fork) bool {
-    if (address == ecrecover_address or address == sha256_address or
-        address == ripemd160_address or address == identity_address or
-        address == modexp_address or address == blake2f_address or
-        address == kzg_address)
-        return true;
+    if (address >= 1 and address <= 17) return true;
     return address == p256verify_address and fork.at_least(.osaka);
 }
 
@@ -43,8 +49,18 @@ pub fn gas_cost(address: u256, input: []const u8, fork: Fork) error{OutOfGas}!u6
         ripemd160_address => gas_mod.gas_ripemd_base + words * gas_mod.gas_ripemd_word,
         identity_address => gas_mod.gas_identity_base + words * gas_mod.gas_identity_word,
         modexp_address => modexp.gas_cost(input, fork),
+        bn254_add_address => bn254.gas_add(input),
+        bn254_mul_address => bn254.gas_mul(input),
+        bn254_pairing_address => bn254.gas_pairing(input),
         blake2f_address => blake2f.gas_cost(input),
         kzg_address => gas_mod.gas_kzg_point_evaluation,
+        bls_g1_add_address => bls12.gas_g1_add(input),
+        bls_g1_msm_address => bls12.gas_g1_msm(input),
+        bls_g2_add_address => bls12.gas_g2_add(input),
+        bls_g2_msm_address => bls12.gas_g2_msm(input),
+        bls_pairing_address => bls12.gas_pairing(input),
+        bls_map_g1_address => bls12.gas_g1_map(input),
+        bls_map_g2_address => bls12.gas_g2_map(input),
         p256verify_address => gas_mod.gas_p256verify,
         else => unreachable,
     };
@@ -58,8 +74,18 @@ pub fn execute(address: u256, input: []const u8, out: []u8, fork: Fork) error{ O
         ripemd160_address => ripemd160.execute(input, out),
         identity_address => exec_identity(input, out),
         modexp_address => modexp.execute(input, out, fork),
+        bn254_add_address => bn254.execute_add(input, out),
+        bn254_mul_address => bn254.execute_mul(input, out),
+        bn254_pairing_address => bn254.execute_pairing(input, out),
         blake2f_address => blake2f.execute(input, out),
         kzg_address => kzg.execute(input, out),
+        bls_g1_add_address => bls12.execute_g1_add(input, out),
+        bls_g1_msm_address => bls12.execute_g1_msm(input, out),
+        bls_g2_add_address => bls12.execute_g2_add(input, out),
+        bls_g2_msm_address => bls12.execute_g2_msm(input, out),
+        bls_pairing_address => bls12.execute_pairing(input, out),
+        bls_map_g1_address => bls12.execute_map_fp_to_g1(input, out),
+        bls_map_g2_address => bls12.execute_map_fp2_to_g2(input, out),
         p256verify_address => exec_p256verify(input, out),
         else => unreachable,
     };

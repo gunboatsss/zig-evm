@@ -19,6 +19,8 @@ test {
     _ = @import("ripemd160.zig");
     _ = @import("blake2f.zig");
     _ = @import("kzg.zig");
+    _ = @import("bn254.zig");
+    _ = @import("bls12.zig");
     _ = @import("cheatcode.zig");
     _ = @import("artifact.zig");
     _ = @import("interpreter.zig");

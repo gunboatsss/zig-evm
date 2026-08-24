@@ -14,9 +14,9 @@ spec tests) and `build.zig`.
   which do **not** compile on Zig 0.15 or earlier, and the master 0.17-dev API
   has since drifted. Repo-managed Cloud Agents get Zig from `.cursor/Dockerfile`;
   `zig version` should print `0.16.0`.
-- `build.zig.zon` has no package-manager deps. POINT_EVALUATION (`0x0a`) links
-  vendored [c-kzg-4844](https://github.com/ethereum/c-kzg-4844) + blst under
-  `vendor/` (see `vendor/ORIGIN.txt`). A Tiger Style Zig rewrite is not in yet.
+- `build.zig.zon` has no package-manager deps. POINT_EVALUATION (`0x0a`) and
+  BLS12-381 (`0x0b`–`0x11`) link vendored [c-kzg-4844](https://github.com/ethereum/c-kzg-4844)
+  + blst under `vendor/` (see `vendor/ORIGIN.txt`). A Tiger Style Zig rewrite is not in yet.
 
 ### Build / test / lint / run
 

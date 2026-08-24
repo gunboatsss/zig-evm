@@ -39,6 +39,8 @@ pub const blob_schedule_max: u32 = 9;
 pub const kzg_versioned_hash_version: u8 = 0x01;
 /// Parse cap for a tx hash list. Protocol max is `blob_schedule_max`.
 pub const blob_versioned_hashes_max: u32 = 16;
+/// EIP-4895 withdrawals in one block.
+pub const withdrawals_max: u32 = 1024;
 /// EIP-7951 `P256VERIFY` input is exactly 160 bytes.
 pub const p256verify_input_bytes: u32 = 160;
 pub const returndata_bytes_max: u32 = 64 * 1024;
@@ -112,6 +114,7 @@ comptime {
     std.debug.assert(blob_schedule_max == 9);
     std.debug.assert(kzg_versioned_hash_version == 0x01);
     std.debug.assert(blob_versioned_hashes_max >= blob_schedule_max);
+    std.debug.assert(withdrawals_max > 0);
     std.debug.assert(blob_schedule_max * 131_072 == 1_179_648);
     std.debug.assert(p256verify_input_bytes == 160);
     std.debug.assert(blake2f_input_bytes == 213);
