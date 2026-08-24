@@ -85,6 +85,8 @@ pub const BlockTx = struct {
     gas_price: u256,
     access_list: []const AccessListItem = &.{},
     authorizations: []const Authorization = &.{},
+    blob_versioned_hashes: []const [32]u8 = &.{},
+    max_fee_per_blob_gas: u256 = 0,
 };
 
 /// EIP-4788 / EIP-2935 / EIP-7002 / EIP-7251 system caller.
@@ -121,6 +123,8 @@ pub const Vm = struct {
     gas_refund: i64,
     access_list: []const AccessListItem,
     authorizations: []const delegation.Authorization,
+    blob_versioned_hashes: []const [32]u8,
+    max_fee_per_blob_gas: u256,
     created_this_tx: [limits.accounts_max]u256,
     created_count: u32,
     deleted: [limits.accounts_max]u256,
@@ -128,6 +132,7 @@ pub const Vm = struct {
     block_hashes: [limits.block_hashes_max][32]u8,
     block_hash_count: u32,
     tx_gas_used: u64,
+    tx_blob_gas_used: u64,
     /// Null on the jsontest / forge-test path. Set only by `debug`.
     trace: ?*trace_mod.Trace,
 
@@ -159,6 +164,9 @@ pub const Vm = struct {
         self.gas_refund = 0;
         self.access_list = &.{};
         self.authorizations = &.{};
+        self.blob_versioned_hashes = &.{};
+        self.max_fee_per_blob_gas = 0;
+        self.tx_blob_gas_used = 0;
         self.created_count = 0;
         self.delete_count = 0;
         self.block_hash_count = header_mod.fill_window(
@@ -210,6 +218,8 @@ pub const Vm = struct {
         self.cheats_enabled = false;
         self.access_list = &.{};
         self.authorizations = &.{};
+        self.blob_versioned_hashes = &.{};
+        self.max_fee_per_blob_gas = 0;
         self.trace = null;
         self.block_hash_count = 0;
         self.reset_tx();
@@ -319,12 +329,15 @@ pub const Vm = struct {
         value: u256,
         sender: u256,
     ) !Status {
+        if (self.fork.at_least(.osaka) and gas_limit > limits.tx_gas_cap) return error.GasLimitTooHigh;
         if (self.authorizations.len != 0 and to == null) return error.InvalidTx;
+        const blob_gas = try self.blob_tx_gas(to);
         const intrinsic = gas_mod.intrinsic_gas(data, to == null) + self.access_list_gas() +
             @as(u64, self.authorizations.len) * gas_mod.gas_auth_per_empty;
         if (gas_limit < intrinsic) return error.IntrinsicGas;
         const fees = gas_mod.fees_from_prices(self.env.gas_price, self.env.base_fee);
-        const upfront = @as(u256, gas_limit) * fees.effective;
+        const upfront = @as(u256, gas_limit) * fees.effective +
+            @as(u256, blob_gas) * self.max_fee_per_blob_gas;
         const sender_bal = self.world.get_balance(sender);
         if (sender_bal < upfront + value) return error.InsufficientFunds;
         try self.world.set_balance(sender, sender_bal - upfront);
@@ -343,7 +356,7 @@ pub const Vm = struct {
             const created = try self.apply_create(data, exec_gas, value, ctx);
             if (created != 0) try self.destroy_deleted();
         }
-        try self.settle_gas(sender, gas_limit, fees, gas_mod.calldata_floor_gas(data));
+        try self.settle_gas(sender, gas_limit, fees, gas_mod.calldata_floor_gas(data), blob_gas);
         return self.current().status;
     }
 
@@ -353,12 +366,18 @@ pub const Vm = struct {
         self.bind_block(header);
         try self.apply_block_system_pre(header);
         var gas_used: u64 = 0;
+        var blob_gas_used: u64 = 0;
         for (txs) |tx| {
             try self.apply_block_tx(tx);
             const next = @addWithOverflow(gas_used, self.tx_gas_used);
             if (next[1] == 1) return error.BlockGasOverflow;
             gas_used = next[0];
+            const blob_next = @addWithOverflow(blob_gas_used, self.tx_blob_gas_used);
+            if (blob_next[1] == 1) return error.BlobGasLimit;
+            blob_gas_used = blob_next[0];
+            if (blob_gas_used > gas_mod.blob_gas_per_block_max()) return error.BlobGasLimit;
         }
+        if (@as(u256, blob_gas_used) != header.blob_gas_used) return error.BlobGasUsedMismatch;
         try self.apply_block_system_post();
         return gas_used;
     }
@@ -383,12 +402,16 @@ pub const Vm = struct {
         self.env.gas_limit = header.gas_limit;
         self.env.base_fee = header.base_fee;
         self.env.prev_randao = word.from_bytes_be(&header.prev_randao);
+        self.env.blob_base_fee = gas_mod.blob_base_fee(header.excess_blob_gas);
     }
 
     fn apply_block_tx(self: *Vm, tx: BlockTx) !void {
         if (tx.gas_limit == 0) return error.IntrinsicGas;
         self.access_list = tx.access_list;
         self.authorizations = tx.authorizations;
+        self.blob_versioned_hashes = tx.blob_versioned_hashes;
+        std.debug.assert(self.blob_versioned_hashes.len <= limits.blob_versioned_hashes_max);
+        self.max_fee_per_blob_gas = tx.max_fee_per_blob_gas;
         self.env.gas_price = tx.gas_price;
         _ = try self.apply_tx(tx.to, tx.data, tx.gas_limit, tx.value, tx.sender);
     }
@@ -407,11 +430,14 @@ pub const Vm = struct {
         if (self.world.code_of(to).len == 0) return;
         const saved_list = self.access_list;
         const saved_auth = self.authorizations;
+        const saved_blobs = self.blob_versioned_hashes;
         self.access_list = &.{};
         self.authorizations = &.{};
+        self.blob_versioned_hashes = &.{};
         defer {
             self.access_list = saved_list;
             self.authorizations = saved_auth;
+            self.blob_versioned_hashes = saved_blobs;
         }
         var ctx = self.env;
         ctx.caller = system_address;
@@ -420,7 +446,19 @@ pub const Vm = struct {
         _ = self.apply_message(to, data, system_tx_gas, 0, ctx) catch {};
     }
 
-    fn settle_gas(self: *Vm, sender: u256, gas_limit: u64, fees: gas_mod.TxFees, floor: u64) !void {
+    fn blob_tx_gas(self: *const Vm, to: ?u256) !u64 {
+        const hashes = self.blob_versioned_hashes;
+        if (hashes.len == 0) return 0;
+        if (to == null) return error.InvalidTx;
+        if (hashes.len > limits.blob_schedule_max) return error.BlobLimit;
+        for (hashes) |hash| {
+            if (hash[0] != limits.kzg_versioned_hash_version) return error.InvalidBlobHash;
+        }
+        if (self.max_fee_per_blob_gas < self.env.blob_base_fee) return error.BlobFeeTooLow;
+        return gas_mod.blob_gas(@intCast(hashes.len));
+    }
+
+    fn settle_gas(self: *Vm, sender: u256, gas_limit: u64, fees: gas_mod.TxFees, floor: u64, blob_gas: u64) !void {
         std.debug.assert(self.frame_count >= 1);
         const used = gas_mod.settled_gas_used(
             gas_limit,
@@ -429,8 +467,14 @@ pub const Vm = struct {
             floor,
         );
         self.tx_gas_used = used;
+        self.tx_blob_gas_used = blob_gas;
         const unused = gas_limit - used;
-        try self.world.set_balance(sender, self.world.get_balance(sender) + @as(u256, unused) * fees.effective);
+        var refund = @as(u256, unused) * fees.effective;
+        if (blob_gas != 0) {
+            std.debug.assert(self.max_fee_per_blob_gas >= self.env.blob_base_fee);
+            refund += @as(u256, blob_gas) * (self.max_fee_per_blob_gas - self.env.blob_base_fee);
+        }
+        try self.world.set_balance(sender, self.world.get_balance(sender) + refund);
         const tip = @as(u256, used) * fees.priority;
         if (tip == 0) return;
         try self.world.set_balance(self.env.coinbase, self.world.get_balance(self.env.coinbase) + tip);
@@ -451,6 +495,7 @@ pub const Vm = struct {
         self.created_count = 0;
         self.delete_count = 0;
         self.tx_gas_used = 0;
+        self.tx_blob_gas_used = 0;
     }
 
     fn run_or_fault(self: *Vm) void {
@@ -607,7 +652,7 @@ pub const Vm = struct {
             .chainid => try exec_push_const(frame, self.env.chain_id),
             .selfbalance => try exec_push_const(frame, self.world.get_balance(frame.context.address)),
             .basefee => try exec_push_const(frame, self.env.base_fee),
-            .blobhash => try exec_blobhash(frame),
+            .blobhash => try self.exec_blobhash(),
             .blobbasefee => try exec_push_const(frame, self.env.blob_base_fee),
             .slotnum => try exec_push_const(frame, self.env.slot_number),
             .blockhash => try self.exec_blockhash(),
@@ -661,6 +706,18 @@ pub const Vm = struct {
             wanted,
         );
         try frame.stack.push(hash);
+        return frame.pc + 1;
+    }
+
+    fn exec_blobhash(self: *Vm) !u32 {
+        const frame = self.current();
+        const index = try frame.stack.pop();
+        if (index >= self.blob_versioned_hashes.len) {
+            try frame.stack.push(0);
+            return frame.pc + 1;
+        }
+        const hash = self.blob_versioned_hashes[@intCast(index)];
+        try frame.stack.push(word.from_bytes_be(&hash));
         return frame.pc + 1;
     }
 
@@ -1021,12 +1078,20 @@ pub const Vm = struct {
             return error.OutOfGas;
         };
         try frame.gas.consume(cost);
-        self.output_len = try precompile.execute(
+        self.output_len = precompile.execute(
             frame.code_address,
             frame.calldata,
             self.output_buffer[0..],
             self.fork,
-        );
+        ) catch |err| switch (err) {
+            error.PrecompileFailed => {
+                frame.status = .faulted;
+                frame.gas.used = frame.gas.limit;
+                self.output_len = 0;
+                return;
+            },
+            else => |e| return e,
+        };
         frame.status = .returned;
     }
 
@@ -1733,12 +1798,6 @@ fn exec_mcopy(frame: *Frame) !u32 {
     if (new_size > frame.memory.bytes.len) return error.MemoryOverflow;
     if (length == 0) return frame.pc + 1;
     try frame.memory.copy(try word.to_u32(dest), try word.to_u32(src), try word.to_u32(length));
-    return frame.pc + 1;
-}
-
-fn exec_blobhash(frame: *Frame) !u32 {
-    _ = try frame.stack.pop();
-    try frame.stack.push(0);
     return frame.pc + 1;
 }
 

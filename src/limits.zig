@@ -24,6 +24,21 @@ pub const calldata_bytes_max: u32 = 128 * 1024;
 pub const modexp_len_bytes_max: u32 = 1024;
 /// Scratch for `std.math.big` during MODEXP (base/exp/mod + mul/div).
 pub const modexp_scratch_bytes_max: u32 = 64 * 1024;
+/// EIP-7825: Osaka transaction gas limit cap (`2**24`).
+pub const tx_gas_cap: u64 = 1 << 24;
+/// EIP-152 `BLAKE2F` input is exactly 213 bytes.
+pub const blake2f_input_bytes: u32 = 213;
+pub const blake2f_output_bytes: u32 = 64;
+/// EIP-4844 `POINT_EVALUATION` input is exactly 192 bytes.
+pub const kzg_input_bytes: u32 = 192;
+pub const kzg_output_bytes: u32 = 64;
+pub const kzg_field_elements_per_blob: u256 = 4096;
+/// EIP-4844 / EIP-7691 Prague+ schedule: max blobs per tx and per block.
+pub const blob_schedule_max: u32 = 9;
+/// Version byte of a KZG versioned hash (`sha256(commitment)[0] = 0x01`).
+pub const kzg_versioned_hash_version: u8 = 0x01;
+/// Parse cap for a tx hash list. Protocol max is `blob_schedule_max`.
+pub const blob_versioned_hashes_max: u32 = 16;
 /// EIP-7951 `P256VERIFY` input is exactly 160 bytes.
 pub const p256verify_input_bytes: u32 = 160;
 pub const returndata_bytes_max: u32 = 64 * 1024;
@@ -91,7 +106,17 @@ comptime {
     std.debug.assert(jsontest_bytes_max > 0);
     std.debug.assert(modexp_len_bytes_max == 1024);
     std.debug.assert(modexp_scratch_bytes_max >= 16 * 1024);
+    std.debug.assert(kzg_input_bytes == 192);
+    std.debug.assert(kzg_output_bytes == 64);
+    std.debug.assert(kzg_field_elements_per_blob == 4096);
+    std.debug.assert(blob_schedule_max == 9);
+    std.debug.assert(kzg_versioned_hash_version == 0x01);
+    std.debug.assert(blob_versioned_hashes_max >= blob_schedule_max);
+    std.debug.assert(blob_schedule_max * 131_072 == 1_179_648);
     std.debug.assert(p256verify_input_bytes == 160);
+    std.debug.assert(blake2f_input_bytes == 213);
+    std.debug.assert(blake2f_output_bytes == 64);
+    std.debug.assert(tx_gas_cap == 16_777_216);
     std.debug.assert(authorizations_max > 0);
     std.debug.assert(debug_trace_steps_max > 0);
     std.debug.assert(debug_trace_steps_max <= trace_steps_max);

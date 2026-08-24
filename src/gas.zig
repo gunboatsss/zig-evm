@@ -1,4 +1,5 @@
 const std = @import("std");
+const limits = @import("limits.zig");
 
 pub const Gas = struct {
     limit: u64,
@@ -52,12 +53,20 @@ pub const gas_exp_byte: u64 = 50;
 pub const gas_ecrecover: u64 = 3000;
 pub const gas_sha256_base: u64 = 60;
 pub const gas_sha256_word: u64 = 12;
+pub const gas_ripemd_base: u64 = 600;
+pub const gas_ripemd_word: u64 = 120;
 pub const gas_identity_base: u64 = 15;
 pub const gas_identity_word: u64 = 3;
 /// EIP-2565 minimum (Prague and earlier).
 pub const gas_modexp_min_prague: u64 = 200;
 /// EIP-7883 minimum (Osaka).
 pub const gas_modexp_min_osaka: u64 = 500;
+/// EIP-4844 `GAS_PER_BLOB` (`2**17`). Blob gas is not execution gas.
+pub const gas_per_blob: u64 = 1 << 17;
+/// EIP-7691 / Prague+ `BLOB_BASE_FEE_UPDATE_FRACTION`.
+pub const blob_base_fee_update_fraction: u256 = 5_007_716;
+/// EIP-4844 `POINT_EVALUATION`.
+pub const gas_kzg_point_evaluation: u64 = 50_000;
 /// EIP-7951 `P256VERIFY`.
 pub const gas_p256verify: u64 = 6900;
 pub const gas_log_data: u64 = 8;
@@ -131,6 +140,37 @@ pub fn copy_words_gas(length: u256) !u64 {
 
 pub fn access_list_gas(address_count: u64, key_count: u64) u64 {
     return address_count * gas_tx_access_list_address + key_count * gas_tx_access_list_storage_key;
+}
+
+pub fn blob_gas(count: u32) u64 {
+    std.debug.assert(count <= limits.blob_schedule_max);
+    return @as(u64, count) * gas_per_blob;
+}
+
+pub fn blob_gas_per_block_max() u64 {
+    return blob_gas(limits.blob_schedule_max);
+}
+
+/// EIP-4844 `fake_exponential` / EELS `taylor_exponential`.
+pub fn fake_exponential(factor: u256, numerator: u256, denominator: u256) u256 {
+    std.debug.assert(denominator != 0);
+    var output: u256 = 0;
+    var accum: u256 = factor * denominator;
+    var i: u32 = 1;
+    while (accum > 0) : (i += 1) {
+        std.debug.assert(i <= 1024);
+        output += accum;
+        const den_i = denominator * @as(u256, i);
+        const prod = @mulWithOverflow(accum, numerator);
+        std.debug.assert(prod[1] == 0);
+        accum = prod[0] / den_i;
+    }
+    return output / denominator;
+}
+
+/// `BLOB_MIN_GASPRICE` is 1. Excess 0 yields fee 1.
+pub fn blob_base_fee(excess_blob_gas: u256) u256 {
+    return fake_exponential(1, excess_blob_gas, blob_base_fee_update_fraction);
 }
 
 /// Execution gas after EIP-3529 refund (capped at 1/5 of used) and EIP-7623 floor.
@@ -240,4 +280,17 @@ test "memory expansion gas is cost difference" {
 test "copy words gas zero is zero" {
     try std.testing.expectEqual(@as(u64, 0), try copy_words_gas(0));
     try std.testing.expectEqual(@as(u64, 3), try copy_words_gas(1));
+}
+
+test "blob gas is 2^17 per blob" {
+    try std.testing.expectEqual(@as(u64, 131_072), blob_gas(1));
+    try std.testing.expectEqual(@as(u64, 1_179_648), blob_gas_per_block_max());
+}
+
+test "blob base fee is 1 at excess 0" {
+    try std.testing.expectEqual(@as(u256, 1), blob_base_fee(0));
+}
+
+test "blob base fee is 2 when excess equals the update fraction" {
+    try std.testing.expectEqual(@as(u256, 2), blob_base_fee(blob_base_fee_update_fraction));
 }

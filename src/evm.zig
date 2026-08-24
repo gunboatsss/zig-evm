@@ -92,6 +92,123 @@ test "blockhash of current number is zero" {
     try std.testing.expect(std.mem.allEqual(u8, result.return_data(), 0));
 }
 
+test "blobhash without versioned hashes is zero" {
+    const code = [_]u8{ 0x60, 0x00, 0x49, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expect(std.mem.allEqual(u8, result.return_data(), 0));
+}
+
+test "blobhash returns the versioned hash at index" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    var ctx = ExecutionContext.default();
+    ctx.address = 0xaa;
+    try vm.init(&[_]u8{ 0x60, 0x00, 0x49, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 }, &[_]u8{}, 1_000_000, ctx, .osaka);
+    var hash: [32]u8 = @splat(0);
+    hash[0] = 0x01;
+    hash[31] = 0xab;
+    const hashes = [_][32]u8{hash};
+    vm.blob_versioned_hashes = &hashes;
+    try vm.run();
+    try std.testing.expectEqual(Status.returned, vm.current().status);
+    try std.testing.expectEqualSlices(u8, &hash, vm.output_buffer[0..32]);
+}
+
+test "blobhash past the list is zero" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    var ctx = ExecutionContext.default();
+    ctx.address = 0xaa;
+    try vm.init(&[_]u8{ 0x60, 0x01, 0x49, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 }, &[_]u8{}, 1_000_000, ctx, .osaka);
+    var hash: [32]u8 = @splat(0);
+    hash[0] = 0x01;
+    const hashes = [_][32]u8{hash};
+    vm.blob_versioned_hashes = &hashes;
+    try vm.run();
+    try std.testing.expectEqual(Status.returned, vm.current().status);
+    try std.testing.expect(std.mem.allEqual(u8, vm.output_buffer[0..32], 0));
+}
+
+test "blobbasefee opcode reads env" {
+    const code = [_]u8{ 0x4a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 1), result.return_data()[31]);
+}
+
+fn versioned_blob_hash() [32]u8 {
+    var hash: [32]u8 = @splat(0);
+    hash[0] = 0x01;
+    hash[31] = 0xab;
+    return hash;
+}
+
+test "apply_tx blob fee is burned not tipped" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 262_144);
+    vm.env.gas_price = 0;
+    vm.env.base_fee = 0;
+    vm.env.blob_base_fee = 1;
+    vm.env.coinbase = 2;
+    const hashes = [_][32]u8{versioned_blob_hash()};
+    vm.blob_versioned_hashes = &hashes;
+    vm.max_fee_per_blob_gas = 2;
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 21_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqual(@as(u256, 131_072), vm.world.get_balance(1));
+    try std.testing.expectEqual(@as(u256, 0), vm.world.get_balance(2));
+    try std.testing.expectEqual(@as(u64, 131_072), vm.tx_blob_gas_used);
+}
+
+test "apply_tx blob create is invalid" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const hashes = [_][32]u8{versioned_blob_hash()};
+    vm.blob_versioned_hashes = &hashes;
+    vm.max_fee_per_blob_gas = 1;
+    try std.testing.expectError(error.InvalidTx, vm.apply_tx(null, &[_]u8{}, 53_000, 0, 1));
+}
+
+test "apply_tx blob hash version must be 0x01" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    var hash: [32]u8 = @splat(0);
+    hash[31] = 0xab;
+    const hashes = [_][32]u8{hash};
+    vm.blob_versioned_hashes = &hashes;
+    vm.max_fee_per_blob_gas = 1;
+    try std.testing.expectError(error.InvalidBlobHash, vm.apply_tx(0xaa, &[_]u8{}, 21_000, 0, 1));
+}
+
+test "apply_tx blob max fee below blob base fee" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const hashes = [_][32]u8{versioned_blob_hash()};
+    vm.blob_versioned_hashes = &hashes;
+    vm.env.blob_base_fee = 2;
+    vm.max_fee_per_blob_gas = 1;
+    try std.testing.expectError(error.BlobFeeTooLow, vm.apply_tx(0xaa, &[_]u8{}, 21_000, 0, 1));
+}
+
+test "apply_tx more than nine blobs is over the schedule" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    var hashes: [10][32]u8 = undefined;
+    for (&hashes) |*hash| {
+        hash.* = versioned_blob_hash();
+    }
+    vm.blob_versioned_hashes = &hashes;
+    vm.max_fee_per_blob_gas = 1;
+    try std.testing.expectError(error.BlobLimit, vm.apply_tx(0xaa, &[_]u8{}, 21_000, 0, 1));
+}
+
 test "interpreter gt is top greater than second" {
     const code = [_]u8{ 0x60, 0x02, 0x60, 0x03, 0x11, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
@@ -203,9 +320,9 @@ test "amsterdam slotnum" {
 test "osaka tstore tload" {
     const code = [_]u8{
         0x60, 0x07, 0x60, 0x00, 0x5d,
-        0x60, 0x00, 0x5c,
-        0x60, 0x00, 0x52,
-        0x60, 0x20, 0x60, 0x00, 0xf3,
+        0x60, 0x00, 0x5c, 0x60, 0x00,
+        0x52, 0x60, 0x20, 0x60, 0x00,
+        0xf3,
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
@@ -215,8 +332,9 @@ test "osaka tstore tload" {
 test "osaka mcopy" {
     const code = [_]u8{
         0x60, 0x42, 0x60, 0x00, 0x53,
-        0x60, 0x01, 0x60, 0x00, 0x60, 0x20, 0x5e,
-        0x60, 0x20, 0x60, 0x20, 0xf3,
+        0x60, 0x01, 0x60, 0x00, 0x60,
+        0x20, 0x5e, 0x60, 0x20, 0x60,
+        0x20, 0xf3,
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
@@ -227,7 +345,8 @@ test "mcopy length zero does not expand memory" {
     // PUSH1 0 PUSH1 0 PUSH1 32 MCOPY MSIZE PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
     const code = [_]u8{
         0x60, 0x00, 0x60, 0x00, 0x60, 0x20, 0x5e,
-        0x59, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        0x59, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60,
+        0x00, 0xf3,
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
@@ -258,8 +377,8 @@ test "apply_tx access list adds intrinsic gas" {
     const keys = [_]u256{};
     const items = [_]AccessListItem{.{ .address = 9, .keys = &keys }};
     vm.access_list = &items;
-    try std.testing.expectError(error.IntrinsicGas, vm.apply_tx(3, &[_]u8{}, 23_399, 0, 1));
-    const status = try vm.apply_tx(3, &[_]u8{}, 23_400, 0, 1);
+    try std.testing.expectError(error.IntrinsicGas, vm.apply_tx(0xaa, &[_]u8{}, 23_399, 0, 1));
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 23_400, 0, 1);
     try std.testing.expectEqual(Status.stopped, status);
     try std.testing.expectEqual(@as(u256, 23_400), vm.world.get_balance(2));
 }
@@ -279,7 +398,7 @@ test "apply_tx warms an access list larger than 4096 keys" {
     vm.env.gas_price = 1;
     vm.env.base_fee = 0;
     vm.env.coinbase = 2;
-    const status = try vm.apply_tx(3, &[_]u8{}, intrinsic, 0, 1);
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, intrinsic, 0, 1);
     try std.testing.expectEqual(Status.stopped, status);
 }
 
@@ -287,14 +406,14 @@ test "selfdestruct pre-existing transfers and keeps code" {
     const vm = try std.testing.allocator.create(Vm);
     defer std.testing.allocator.destroy(vm);
     var ctx = ExecutionContext.default();
-    ctx.address = 3;
+    ctx.address = 0xaa;
     try vm.init(&[_]u8{ 0x60, 0x04, 0xff }, &[_]u8{}, 1_000_000, ctx, .osaka);
-    try vm.world.set_balance(3, 1_000);
+    try vm.world.set_balance(0xaa, 1_000);
     try vm.run();
     try std.testing.expectEqual(Status.stopped, vm.current().status);
-    try std.testing.expectEqual(@as(u256, 0), vm.world.get_balance(3));
+    try std.testing.expectEqual(@as(u256, 0), vm.world.get_balance(0xaa));
     try std.testing.expectEqual(@as(u256, 1_000), vm.world.get_balance(4));
-    try std.testing.expectEqual(@as(usize, 3), vm.world.code_of(3).len);
+    try std.testing.expectEqual(@as(usize, 3), vm.world.code_of(0xaa).len);
 }
 
 test "create then selfdestruct deletes new account" {
@@ -355,8 +474,14 @@ test "create deploys empty contract" {
         0x60, 0x00, // endowment
         0xf0, // CREATE
         0x15, // ISZERO
-        0x60, 0x00, 0x52,
-        0x60, 0x20, 0x60, 0x00, 0xf3,
+        0x60,
+        0x00,
+        0x52,
+        0x60,
+        0x20,
+        0x60,
+        0x00,
+        0xf3,
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
@@ -367,8 +492,8 @@ test "create deploys empty contract" {
 test "keccak256 empty" {
     const code = [_]u8{
         0x60, 0x00, 0x60, 0x00, 0x20,
-        0x60, 0x00, 0x52,
-        0x60, 0x20, 0x60, 0x00, 0xf3,
+        0x60, 0x00, 0x52, 0x60, 0x20,
+        0x60, 0x00, 0xf3,
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
@@ -440,7 +565,8 @@ test "sha256 precompile empty hash" {
 test "identity precompile copies calldata" {
     const code = [_]u8{
         0x60, 0x02, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY size=2
-        0x60, 0x02, 0x60, 0x00, 0x60, 0x02, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x02, 0x60, 0x00, 0x60, 0x02, 0x60,
+        0x00, 0x60, 0x00,
         0x60, 0x04, 0x61, 0xff, 0xff, 0xf1, // CALL identity
         0x60, 0x02, 0x60, 0x00, 0xf3,
     };
@@ -450,10 +576,97 @@ test "identity precompile copies calldata" {
     try std.testing.expectEqualSlices(u8, &calldata, result.return_data());
 }
 
+test "ripemd160 precompile empty hash" {
+    const code = [_]u8{
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x03, 0x61, 0xff, 0xff, 0xfa, // STATICCALL ripemd160
+        0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0x9c), result.return_data()[12]);
+    try std.testing.expectEqual(@as(u8, 0x31), result.return_data()[31]);
+}
+
+test "blake2f precompile zero rounds" {
+    const code = [_]u8{
+        0x60, 0xd5, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY 213
+        0x60, 0x40, 0x60, 0x00, 0x60, 0xd5, 0x60,
+        0x00,
+        0x60, 0x09, 0x61, 0xff, 0xff, 0xfa, // STATICCALL blake2f
+        0x60, 0x40, 0x60, 0x00, 0xf3,
+    };
+    var calldata: [213]u8 = @splat(0);
+    const h = [_]u8{
+        0x48, 0xc9, 0xbd, 0xf2, 0x67, 0xe6, 0x09, 0x6a, 0x3b, 0xa7, 0xca, 0x84, 0x85, 0xae, 0x67, 0xbb,
+        0x2b, 0xf8, 0x94, 0xfe, 0x72, 0xf3, 0x6e, 0x3c, 0xf1, 0x36, 0x1d, 0x5f, 0x3a, 0xf5, 0x4f, 0xa5,
+        0xd1, 0x82, 0xe6, 0xad, 0x7f, 0x52, 0x0e, 0x51, 0x1f, 0x6c, 0x3e, 0x2b, 0x8c, 0x68, 0x05, 0x9b,
+        0x6b, 0xbd, 0x41, 0xfb, 0xab, 0xd9, 0x83, 0x1f, 0x79, 0x21, 0x7e, 0x13, 0x19, 0xcd, 0xe0, 0x5b,
+    };
+    @memcpy(calldata[4..68], &h);
+    calldata[68] = 'a';
+    calldata[69] = 'b';
+    calldata[70] = 'c';
+    std.mem.writeInt(u64, calldata[196..204], 3, .little);
+    calldata[212] = 1;
+    const result = try execute(std.testing.allocator, &code, &calldata, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0x08), result.return_data()[0]);
+    try std.testing.expectEqual(@as(u8, 0x5b), result.return_data()[63]);
+}
+
+test "blake2f precompile rejects short input" {
+    const code = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x09, 0x61, 0xff, 0xff, 0xfa, // STATICCALL blake2f
+        0x60, 0x00, 0x52, 0x60, 0x20, 0x60,
+        0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u256, 0), word.from_bytes_be(result.return_data()[0..32]));
+}
+
+test "kzg point evaluation rejects short input" {
+    const code = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x0a, 0x61, 0xff, 0xff, 0xfa, // STATICCALL point evaluation
+        0x60, 0x00, 0x52, 0x60, 0x20, 0x60,
+        0x00, 0xf3,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u256, 0), word.from_bytes_be(result.return_data()[0..32]));
+}
+
+test "osaka rejects tx gas above 2^24" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    vm.env.gas_price = 0;
+    vm.env.base_fee = 0;
+    try std.testing.expectError(error.GasLimitTooHigh, vm.apply_tx(0xaa, &[_]u8{}, limits.tx_gas_cap + 1, 0, 1));
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, limits.tx_gas_cap, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+}
+
+test "prague allows tx gas above 2^24" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.prague);
+    try vm.world.set_balance(1, 1_000_000);
+    vm.env.gas_price = 0;
+    vm.env.base_fee = 0;
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, limits.tx_gas_cap + 1, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+}
+
 test "modexp precompile 3**2 mod 5" {
     const code = [_]u8{
         0x60, 0x63, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY 99
-        0x60, 0x20, 0x60, 0x00, 0x60, 0x63, 0x60, 0x00,
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x63, 0x60,
+        0x00,
         0x60, 0x05, 0x61, 0xff, 0xff, 0xfa, // STATICCALL modexp
         0x60, 0x01, 0x60, 0x00, 0xf3,
     };
@@ -569,8 +782,9 @@ test "run path does not intercept hevm" {
     const code = [_]u8{
         0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
         0x73, 0x71, 0x09, 0x70, 0x9e, 0xcf, 0xa9, 0x1a, 0x80, 0x62,
-        0x6f, 0xf3, 0x98, 0x9d, 0x68, 0xf6, 0x7f, 0x5b, 0x1d, 0xd1, 0x2d,
-        0x61, 0xff, 0xff, 0xf1, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        0x6f, 0xf3, 0x98, 0x9d, 0x68, 0xf6, 0x7f, 0x5b, 0x1d, 0xd1,
+        0x2d, 0x61, 0xff, 0xff, 0xf1, 0x60, 0x00, 0x52, 0x60, 0x20,
+        0x60, 0x00, 0xf3,
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
@@ -675,7 +889,7 @@ test "apply_tx charges intrinsic gas" {
     vm.env.gas_price = 1;
     vm.env.base_fee = 0;
     vm.env.coinbase = 2;
-    const status = try vm.apply_tx(3, &[_]u8{}, 21_000, 0, 1);
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 21_000, 0, 1);
     try std.testing.expectEqual(Status.stopped, status);
     try std.testing.expectEqual(@as(u256, 979_000), vm.world.get_balance(1));
     try std.testing.expectEqual(@as(u256, 21_000), vm.world.get_balance(2));
@@ -703,14 +917,14 @@ test "apply_tx refunds sstore clear" {
     defer std.testing.allocator.destroy(vm);
     vm.init_plain(.osaka);
     try vm.world.set_balance(1, 1_000_000);
-    try vm.world.set_code(3, &[_]u8{ 0x60, 0x00, 0x60, 0x00, 0x55, 0x00 });
-    try vm.world.store(3, 0, 1);
+    try vm.world.set_code(0xaa, &[_]u8{ 0x60, 0x00, 0x60, 0x00, 0x55, 0x00 });
+    try vm.world.store(0xaa, 0, 1);
     vm.env.gas_price = 1;
     vm.env.base_fee = 0;
     vm.env.coinbase = 2;
-    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 100_000, 0, 1);
     try std.testing.expectEqual(Status.stopped, status);
-    try std.testing.expectEqual(@as(u256, 0), vm.world.load(3, 0));
+    try std.testing.expectEqual(@as(u256, 0), vm.world.load(0xaa, 0));
     try std.testing.expectEqual(@as(u256, 978_794), vm.world.get_balance(1));
     try std.testing.expectEqual(@as(u256, 21_206), vm.world.get_balance(2));
 }
@@ -720,13 +934,13 @@ test "top-level revert undoes sstore" {
     defer std.testing.allocator.destroy(vm);
     vm.init_plain(.osaka);
     try vm.world.set_balance(1, 1_000_000);
-    try vm.world.set_code(3, &[_]u8{ 0x60, 0x01, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xfd });
+    try vm.world.set_code(0xaa, &[_]u8{ 0x60, 0x01, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xfd });
     vm.env.gas_price = 1;
     vm.env.base_fee = 0;
     vm.env.coinbase = 2;
-    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 100_000, 0, 1);
     try std.testing.expectEqual(Status.reverted, status);
-    try std.testing.expectEqual(@as(u256, 0), vm.world.load(3, 0));
+    try std.testing.expectEqual(@as(u256, 0), vm.world.load(0xaa, 0));
 }
 
 fn clz_set_code_auth() Authorization {
@@ -766,7 +980,9 @@ test "apply_tx processes authorization and executes delegated code" {
     try vm.world.set_code(impl, &[_]u8{
         0x60, 0x01, 0x1e, 0x60, 0x00, 0x55,
         0x60, 0x02, 0x1e, 0x60, 0x01, 0x55,
-        0x70, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x70, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x1e, 0x60, 0x02, 0x55, 0x00,
     });
     try vm.world.set_nonce(impl, 1);
@@ -792,7 +1008,7 @@ test "authorization survives top-level revert" {
     vm.init_plain(.osaka);
     const authority: u256 = 0x89873a93c67fc34d662483a081ebaabe443ea62f;
     const impl: u256 = 0x3d8e2d77bca8c0ed68f6d4860444bad2cc2cd661;
-    try vm.world.set_code(3, &[_]u8{ 0x60, 0x00, 0x60, 0x00, 0xfd });
+    try vm.world.set_code(0xaa, &[_]u8{ 0x60, 0x00, 0x60, 0x00, 0xfd });
     try vm.world.set_balance(1, 10_000_000);
     vm.env.gas_price = 1;
     vm.env.base_fee = 0;
@@ -800,7 +1016,7 @@ test "authorization survives top-level revert" {
     vm.env.chain_id = 1;
     const auths = [_]Authorization{clz_set_code_auth()};
     vm.authorizations = &auths;
-    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 100_000, 0, 1);
     try std.testing.expectEqual(Status.reverted, status);
     try std.testing.expectEqualSlices(u8, &delegation.designation(impl), vm.world.code_of(authority));
     try std.testing.expectEqual(@as(u64, 1), vm.world.get_nonce(authority));
@@ -813,14 +1029,14 @@ test "existing authority refunds auth base cost" {
     const authority: u256 = 0x89873a93c67fc34d662483a081ebaabe443ea62f;
     try vm.world.set_balance(authority, 1);
     try vm.world.set_balance(1, 10_000_000);
-    try vm.world.set_code(3, &[_]u8{0x00});
+    try vm.world.set_code(0xaa, &[_]u8{0x00});
     vm.env.gas_price = 1;
     vm.env.base_fee = 0;
     vm.env.coinbase = 2;
     vm.env.chain_id = 1;
     const auths = [_]Authorization{clz_set_code_auth()};
     vm.authorizations = &auths;
-    const status = try vm.apply_tx(3, &[_]u8{}, 100_000, 0, 1);
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 100_000, 0, 1);
     try std.testing.expectEqual(Status.stopped, status);
     try std.testing.expectEqual(@as(i64, 12_500), vm.gas_refund);
 }
@@ -835,7 +1051,7 @@ test "apply_tx authorization adds intrinsic gas" {
     vm.env.coinbase = 2;
     const auths = [_]Authorization{clz_set_code_auth()};
     vm.authorizations = &auths;
-    try std.testing.expectError(error.IntrinsicGas, vm.apply_tx(3, &[_]u8{}, 45_999, 0, 1));
+    try std.testing.expectError(error.IntrinsicGas, vm.apply_tx(0xaa, &[_]u8{}, 45_999, 0, 1));
 }
 
 test "apply_block runs a tx and BLOCKHASH sees the parent" {
@@ -845,7 +1061,7 @@ test "apply_block runs a tx and BLOCKHASH sees the parent" {
     defer std.testing.allocator.destroy(vm);
     vm.init_plain(.osaka);
     try vm.world.set_balance(1, 1_000_000);
-    try vm.world.set_code(3, &[_]u8{ 0x60, 0x00, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 });
+    try vm.world.set_code(0xaa, &[_]u8{ 0x60, 0x00, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 });
     vm.env.chain_id = 1;
     const genesis = header_mod.Header{
         .number = 0,
@@ -866,7 +1082,7 @@ test "apply_block runs a tx and BLOCKHASH sees the parent" {
         .withdrawals_root = trie_mod.empty_root,
     };
     const txs = [_]BlockTx{.{
-        .to = 3,
+        .to = 0xaa,
         .data = &.{},
         .gas_limit = 100_000,
         .value = 0,
@@ -879,6 +1095,81 @@ test "apply_block runs a tx and BLOCKHASH sees the parent" {
     try std.testing.expectEqualSlices(u8, &genesis_hash, vm.output_buffer[0..32]);
     vm.push_block_hash(block.hash());
     try std.testing.expectEqual(@as(u32, 2), vm.block_hash_count);
+}
+
+test "apply_block blob gas matches the header" {
+    const header_mod = @import("header.zig");
+    const trie_mod = @import("trie.zig");
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 262_144);
+    const hashes = [_][32]u8{versioned_blob_hash()};
+    const block = header_mod.Header{
+        .number = 1,
+        .gas_limit = 30_000_000,
+        .timestamp = 2,
+        .withdrawals_root = trie_mod.empty_root,
+        .blob_gas_used = 131_072,
+        .excess_blob_gas = 0,
+    };
+    const txs = [_]BlockTx{.{
+        .to = 0xaa,
+        .data = &.{},
+        .gas_limit = 21_000,
+        .value = 0,
+        .sender = 1,
+        .gas_price = 0,
+        .blob_versioned_hashes = &hashes,
+        .max_fee_per_blob_gas = 1,
+    }};
+    const gas_used = try vm.apply_block(block, &txs);
+    try std.testing.expectEqual(@as(u64, 21_000), gas_used);
+    try std.testing.expectEqual(@as(u256, 1), vm.env.blob_base_fee);
+    try std.testing.expectEqual(@as(u256, 131_072), vm.world.get_balance(1));
+}
+
+test "apply_block blob gas used must match the header" {
+    const header_mod = @import("header.zig");
+    const trie_mod = @import("trie.zig");
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    const block = header_mod.Header{
+        .number = 1,
+        .gas_limit = 30_000_000,
+        .timestamp = 2,
+        .withdrawals_root = trie_mod.empty_root,
+        .blob_gas_used = 1,
+    };
+    const txs = [_]BlockTx{.{
+        .to = 0xaa,
+        .data = &.{},
+        .gas_limit = 21_000,
+        .value = 0,
+        .sender = 1,
+        .gas_price = 0,
+    }};
+    try std.testing.expectError(error.BlobGasUsedMismatch, vm.apply_block(block, &txs));
+}
+
+test "apply_block sets blob base fee from excess blob gas" {
+    const header_mod = @import("header.zig");
+    const gas_mod = @import("gas.zig");
+    const trie_mod = @import("trie.zig");
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const block = header_mod.Header{
+        .number = 1,
+        .gas_limit = 30_000_000,
+        .timestamp = 2,
+        .withdrawals_root = trie_mod.empty_root,
+        .excess_blob_gas = gas_mod.blob_base_fee_update_fraction,
+    };
+    _ = try vm.apply_block(block, &.{});
+    try std.testing.expectEqual(@as(u256, 2), vm.env.blob_base_fee);
 }
 
 test "push_block_hash keeps a 256-window" {

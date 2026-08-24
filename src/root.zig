@@ -16,6 +16,9 @@ test {
     _ = @import("delegation.zig");
     _ = @import("precompile.zig");
     _ = @import("modexp.zig");
+    _ = @import("ripemd160.zig");
+    _ = @import("blake2f.zig");
+    _ = @import("kzg.zig");
     _ = @import("cheatcode.zig");
     _ = @import("artifact.zig");
     _ = @import("interpreter.zig");

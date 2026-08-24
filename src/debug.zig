@@ -62,7 +62,7 @@ pub fn parse_params(pairs: []const [:0]const u8) !Params {
 
 pub fn is_command(text: []const u8) bool {
     const names = [_][]const u8{
-        "overview", "call-tree", "storage-diff", "pc", "opcode", "trace",
+        "overview", "call-tree", "storage-diff", "pc",   "opcode", "trace",
         "state",    "step",      "explain",      "diff", "source", "watch-memory",
     };
     for (names) |name| {
@@ -917,6 +917,8 @@ fn explain_info(byte: u8) Explain {
         0x19 => make_explain("bitwise", "Bitwise NOT", &.{"a"}),
         0x1e => make_explain("bitwise", "Count leading zeros", &.{"a"}),
         0x20 => make_explain("keccak", "Keccak-256 hash of memory", &.{ "offset", "size" }),
+        0x49 => make_explain("block", "Versioned blob hash at index", &.{"index"}),
+        0x4a => make_explain("block", "Blob base fee of the current block", &.{}),
         0x50 => make_explain("stack", "Pop the top stack item", &.{"a"}),
         0x51 => make_explain("memory", "Load a word from memory", &.{"offset"}),
         0x52 => make_explain("memory", "Store a word to memory", &.{ "offset", "value" }),

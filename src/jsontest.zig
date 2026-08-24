@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const evm = @import("evm.zig");
+const gas_mod = @import("gas.zig");
 const header_mod = @import("header.zig");
 const limits = @import("limits.zig");
 const trie_mod = @import("trie.zig");
@@ -38,6 +39,7 @@ const JsonEnv = struct {
     currentTimestamp: []const u8 = "0x01",
     currentBaseFee: []const u8 = "0x00",
     currentRandom: []const u8 = "0x00",
+    currentExcessBlobGas: []const u8 = "0x00",
 };
 
 const JsonIndexes = struct {
@@ -66,6 +68,8 @@ const JsonTx = struct {
     secretKey: []const u8 = "",
     accessLists: []const []const JsonAccessTuple = &.{},
     authorizationList: []const JsonAuthorization = &.{},
+    blobVersionedHashes: []const []const u8 = &.{},
+    maxFeePerBlobGas: []const u8 = "",
 };
 
 const JsonAuthorization = struct {
@@ -232,9 +236,10 @@ fn select_post(post: *const std.json.ArrayHashMap([]JsonPostCase), fork: evm.For
 /// Cancun (EIP-6780) must beat Shanghai (old SELFDESTRUCT).
 fn network_rank(name: []const u8) ?i32 {
     const forks = [_][]const u8{
-        "frontier", "homestead", "tangerinewhistle", "spuriousdragon", "byzantium",
-        "constantinople", "petersburg", "istanbul", "berlin", "london", "paris", "merge",
-        "shanghai", "cancun", "prague", "osaka", "amsterdam",
+        "frontier",       "homestead",  "tangerinewhistle", "spuriousdragon", "byzantium",
+        "constantinople", "petersburg", "istanbul",         "berlin",         "london",
+        "paris",          "merge",      "shanghai",         "cancun",         "prague",
+        "osaka",          "amsterdam",
     };
     for (forks, 0..) |fork_name, index| {
         if (std.ascii.eqlIgnoreCase(name, fork_name)) return @intCast(index);
@@ -342,6 +347,10 @@ fn apply_and_check(
     const auths = try parse_authorizations(allocator, fixture.transaction.authorizationList);
     defer if (auths.len != 0) allocator.free(auths);
     vm.authorizations = auths;
+    const blobs = try parse_blob_hashes(allocator, fixture.transaction.blobVersionedHashes);
+    defer if (blobs.len != 0) allocator.free(blobs);
+    vm.blob_versioned_hashes = blobs;
+    vm.max_fee_per_blob_gas = try parse_u256(fixture.transaction.maxFeePerBlobGas);
     const to = try call_target(fixture.transaction.to);
     _ = vm.apply_tx(to, data, gas_limit, value, sender) catch return .fail;
     if (state) |expected| {
@@ -398,7 +407,8 @@ fn fixture_fork(name: []const u8) ?evm.Fork {
     if (evm.Fork.from_name(name)) |fork| return fork;
     const pre_prague = [_][]const u8{
         "frontier", "homestead", "byzantium", "constantinople", "petersburg",
-        "istanbul", "berlin", "london", "paris", "merge", "shanghai", "cancun",
+        "istanbul", "berlin",    "london",    "paris",          "merge",
+        "shanghai", "cancun",
     };
     for (pre_prague) |fork_name| {
         if (std.ascii.eqlIgnoreCase(name, fork_name)) return .prague;
@@ -436,6 +446,7 @@ fn bind_env(vm: *evm.Vm, fixture: *const JsonTest, sender: u256) !void {
     vm.env.base_fee = try parse_u256(env.currentBaseFee);
     vm.env.prev_randao = try parse_u256(randao);
     vm.env.chain_id = try parse_u256(fixture.config.chainid);
+    vm.env.blob_base_fee = gas_mod.blob_base_fee(try parse_u256(env.currentExcessBlobGas));
     vm.env.gas_price = try tx_effective_gas_price(fixture.transaction, vm.env.base_fee);
     vm.env.origin = sender;
     vm.env.caller = sender;
@@ -565,6 +576,17 @@ fn parse_authorizations(
         };
     }
     return items;
+}
+
+fn parse_blob_hashes(allocator: std.mem.Allocator, hashes: []const []const u8) ![][32]u8 {
+    if (hashes.len == 0) return &.{};
+    if (hashes.len > limits.blob_versioned_hashes_max) return error.BlobLimit;
+    const out = try allocator.alloc([32]u8, hashes.len);
+    errdefer allocator.free(out);
+    for (hashes, 0..) |text, index| {
+        out[index] = try parse_hash32(text);
+    }
+    return out;
 }
 
 fn tx_effective_gas_price(tx: JsonTx, base_fee: u256) !u256 {

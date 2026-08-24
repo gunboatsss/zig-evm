@@ -1,6 +1,6 @@
 //! EEST `blockchain_tests` JSON runner.
 //!
-//! Valid Osaka blocks first: skip `expectException`, uncles, blobs, and
+//! Valid Osaka blocks first: skip `expectException`, uncles, and
 //! withdrawals. Transaction / receipt tries are copied from the fixture so
 //! header hashing still matches when `stateRoot` and `gasUsed` are right.
 
@@ -78,7 +78,7 @@ const JsonHeader = struct {
 };
 
 const JsonTx = struct {
-    @"type": []const u8 = "0x00",
+    type: []const u8 = "0x00",
     sender: []const u8 = "",
     secretKey: []const u8 = "",
     to: ?[]const u8 = null,
@@ -241,10 +241,6 @@ fn skip_reason(name: []const u8, fixture: *const JsonFixture, fork: evm.Fork) ?[
             if (w.len != 0) return "withdrawals";
         }
         if (unsupported_header(block.blockHeader.?)) |why| return why;
-        for (block.transactions) |tx| {
-            if (tx.blobVersionedHashes.len != 0) return "blob-tx";
-            if (!is_blank_hex(tx.maxFeePerBlobGas)) return "blob-tx";
-        }
     }
     if (unsupported_header(fixture.genesisBlockHeader)) |why| return why;
     return null;
@@ -333,6 +329,8 @@ fn parse_tx(allocator: std.mem.Allocator, json_tx: JsonTx, base_fee: u256) !evm.
     errdefer free_access(allocator, access);
     const auths = try parse_auths(allocator, json_tx.authorizationList);
     errdefer if (auths.len != 0) allocator.free(auths);
+    const blobs = try parse_blob_hashes(allocator, json_tx.blobVersionedHashes);
+    errdefer if (blobs.len != 0) allocator.free(blobs);
     return .{
         .to = try call_target(json_tx.to),
         .data = data,
@@ -342,13 +340,27 @@ fn parse_tx(allocator: std.mem.Allocator, json_tx: JsonTx, base_fee: u256) !evm.
         .gas_price = try tx_gas_price(json_tx, base_fee),
         .access_list = access,
         .authorizations = auths,
+        .blob_versioned_hashes = blobs,
+        .max_fee_per_blob_gas = try parse_u256(json_tx.maxFeePerBlobGas),
     };
+}
+
+fn parse_blob_hashes(allocator: std.mem.Allocator, hashes: []const []const u8) ![][32]u8 {
+    if (hashes.len == 0) return &.{};
+    if (hashes.len > limits.blob_versioned_hashes_max) return error.BlobLimit;
+    const out = try allocator.alloc([32]u8, hashes.len);
+    errdefer allocator.free(out);
+    for (hashes, 0..) |text, index| {
+        out[index] = try parse_fixed(text, 32);
+    }
+    return out;
 }
 
 fn free_tx(allocator: std.mem.Allocator, tx: evm.BlockTx) void {
     allocator.free(tx.data);
     free_access(allocator, tx.access_list);
     if (tx.authorizations.len != 0) allocator.free(@constCast(tx.authorizations));
+    if (tx.blob_versioned_hashes.len != 0) allocator.free(@constCast(tx.blob_versioned_hashes));
 }
 
 fn free_txs(allocator: std.mem.Allocator, txs: []evm.BlockTx) void {
@@ -407,7 +419,8 @@ fn fixture_fork(name: []const u8) ?evm.Fork {
     if (evm.Fork.from_name(name)) |fork| return fork;
     const pre_prague = [_][]const u8{
         "frontier", "homestead", "byzantium", "constantinople", "petersburg",
-        "istanbul", "berlin", "london", "paris", "merge", "shanghai", "cancun",
+        "istanbul", "berlin",    "london",    "paris",          "merge",
+        "shanghai", "cancun",
     };
     for (pre_prague) |fork_name| {
         if (std.ascii.eqlIgnoreCase(name, fork_name)) return .prague;

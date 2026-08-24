@@ -436,7 +436,7 @@ test "run reverting test fails" {
 }
 
 test "forge-test breakpoint is not a pass" {
-    const runtime = [_]u8{ 0xcc };
+    const runtime = [_]u8{0xcc};
     var buf: [16]u8 = undefined;
     const init_code = wrap_runtime(&runtime, &buf);
     const case = Case{ .name = "testBreak", .selector = selector_of("testBreak()"), .kind = .unit };
