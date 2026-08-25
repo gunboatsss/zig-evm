@@ -26,10 +26,11 @@ scripts/fetch_eest_fixtures.sh                 # every state_test, including EIP
 scripts/fetch_eest_fixtures.sh --smoke         # PUSH0, TSTORE, MCOPY, CLZ, 7702, 6780
 scripts/fetch_eest_fixtures.sh --blockchain    # blockchain_tests (valid Osaka blocks)
 zig build jsontest                             # or: zig-evm jsontest tests/eest/state_tests
+zig build jsontest -Djobs=0                    # one worker per CPU (each keeps one VM)
 zig build chaintest                            # or: zig-evm chaintest tests/eest/blockchain_tests
 ```
 
-Fixtures live in `tests/eest/` (gitignored). `post.state` is compared account-by-account, including sender and coinbase balances. A 32-byte `post.hash` is compared to a check-time Merkle Patricia state root. EIP-6780 is the Osaka `SELFDESTRUCT` rule (same-tx only); Shanghai and earlier posts for those tests are skipped. `zig build jsontest -Djsontest-path=path` runs a single file or directory. `chaintest` applies each valid block (`apply_block`), checks `gasUsed` / `stateRoot`, hashes the header, and pushes it onto the 256-block `BLOCKHASH` window. Invalid blocks and uncles are skipped until those paths exist.
+Fixtures live in `tests/eest/` (gitignored). `post.state` is compared account-by-account, including sender and coinbase balances. A 32-byte `post.hash` is compared to a check-time Merkle Patricia state root. Pre-Paris (pre-merge) posts are skipped; Paris, Merge, Shanghai, Cancun, Prague, and Osaka opcode / state tests still run. EIP-6780 is the Osaka `SELFDESTRUCT` rule (same-tx only); Shanghai and earlier posts for those tests are skipped. `zig build jsontest -Djsontest-path=path` runs a single file or directory. `chaintest` applies each block (`apply_block`), checks `gasUsed` / `stateRoot` / header tries (transactions, receipts, withdrawals) and logs bloom when the fixture provides those fields, hashes the header, and pushes it onto the 256-block `BLOCKHASH` window. Invalid blocks with a decoded header must fail to apply (`expectException`). RLP-only invalid blocks and Amsterdam block-access-list tests are skipped. Post-merge uncle lists must be empty.
 
 ## Architecture
 
@@ -46,8 +47,10 @@ src/
   world.zig       # accounts, storage, revert journal
   rlp.zig         # CREATE / CREATE2 addresses
   header.zig      # keccak256(rlp(header)) and the BLOCKHASH window
-  trie.zig        # check-time Merkle Patricia state root
+  trie.zig        # check-time Merkle Patricia state / tx / receipt tries
+  block.zig       # signed tx RLP, receipts, logs bloom, requests hash
   interpreter.zig # iterative call stack, depth cap 1024, apply_block
+  jobrun.zig      # parallel JSON fixture walking for jsontest / chaintest
   evm.zig         # public execute() API
   main.zig        # CLI
 ```
@@ -58,7 +61,7 @@ The interpreter is a loop over a bounded call stack. Nested calls never recurse 
 
 Opcode metadata follows [`ethereum/execution-specs`](https://github.com/ethereum/execution-specs). **Osaka** is the default (`CLZ`, plus Cancun ops `TLOAD`/`TSTORE`, `MCOPY`, `BLOBHASH`/`BLOBBASEFEE`). **Amsterdam** is opt-in (`--fork amsterdam`) and adds `SLOTNUM` and EIP-8024 `DUPN`/`SWAPN`/`EXCHANGE`. Prague remains selectable as an older fork. `BREAKPOINT` (`0xCC`) is opt-in via `--fork prague_breakpoint` / `osaka_breakpoint` / `amsterdam_breakpoint`; Prague, Osaka, and Amsterdam treat it as `InvalidOpcode`.
 
-External calls (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`) run on an iterative stack of at most **1025 frames** (`depth + 1 > 1024` is rejected, matching [execution-specs](https://github.com/ethereum/execution-specs)). `LOG0`–`LOG4` and `SELFDESTRUCT` (EIP-6780) are implemented. Precompiles: `ecrecover` (`0x01`), `sha256` (`0x02`), `ripemd160` (`0x03`), `identity` (`0x04`), `modexp` (`0x05`), alt_bn128 `0x06`–`0x08`, `blake2f` (`0x09`), `point evaluation` (`0x0a`, via [c-kzg-4844](https://github.com/ethereum/c-kzg-4844)), BLS12-381 `0x0b`–`0x11` (via blst), and Osaka `p256verify` (`0x100`). `BLOCKHASH` reads a 256-header window of `keccak256(rlp(header))`. `BLOBHASH` returns the transaction's versioned blob hash at that index, or 0. Type-3 blob transactions charge blob gas (`2^17` per hash, max 9) separately from execution gas: upfront `blob_gas * maxFeePerBlobGas`, then refund `blob_gas * (maxFeePerBlobGas - blob_base_fee)` while burning `blob_gas * blob_base_fee`. `BLOBBASEFEE` is `fake_exponential(1, excess_blob_gas, 5007716)`. Frame memory is capped at 16 MiB (shared 128 MiB pool); expansion past that is OutOfGas. State tests compare account dumps and, when `post.hash` is 32 bytes, a check-time Merkle Patricia state root. Blockchain tests run Osaka system contracts (EIP-4788, EIP-2935, EIP-7002, EIP-7251), credit EIP-4895 withdrawals, then check `gasUsed`, `blobGasUsed`, `stateRoot`, and the header hash. Osaka transactions may not set `gasLimit` above `2^24` (EIP-7825).
+External calls (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`) run on an iterative stack of at most **1025 frames** (`depth + 1 > 1024` is rejected, matching [execution-specs](https://github.com/ethereum/execution-specs)). `LOG0`–`LOG4` and `SELFDESTRUCT` (EIP-6780) are implemented. Precompiles: `ecrecover` (`0x01`), `sha256` (`0x02`), `ripemd160` (`0x03`), `identity` (`0x04`), `modexp` (`0x05`), alt_bn128 `0x06`–`0x08`, `blake2f` (`0x09`), `point evaluation` (`0x0a`, via [c-kzg-4844](https://github.com/ethereum/c-kzg-4844)), BLS12-381 `0x0b`–`0x11` (via blst), and Osaka `p256verify` (`0x100`). `BLOCKHASH` reads a 256-header window of `keccak256(rlp(header))`. `BLOBHASH` returns the transaction's versioned blob hash at that index, or 0. Type-3 blob transactions charge blob gas (`2^17` per hash, max 9) separately from execution gas: upfront `blob_gas * maxFeePerBlobGas`, then refund `blob_gas * (maxFeePerBlobGas - blob_base_fee)` while burning `blob_gas * blob_base_fee`. `BLOBBASEFEE` is `fake_exponential(1, excess_blob_gas, 5007716)`. Frame memory is capped at 16 MiB (shared 128 MiB pool); expansion past that is OutOfGas. State tests compare account dumps and, when `post.hash` is 32 bytes, a check-time Merkle Patricia state root. Blockchain tests run Osaka system contracts (EIP-4788, EIP-2935, EIP-7002, EIP-7251), credit EIP-4895 withdrawals, then check `gasUsed`, `blobGasUsed`, `stateRoot`, transaction/receipt/withdrawal tries, logs bloom, `requestsHash`, and the header hash. The next block's `excessBlobGas` follows EIP-7918. Osaka transactions may not set `gasLimit` above `2^24` (EIP-7825).
 
 ## Tiger Style highlights
 

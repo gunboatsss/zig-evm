@@ -7,6 +7,7 @@ const std = @import("std");
 const evm = @import("evm.zig");
 const gas_mod = @import("gas.zig");
 const header_mod = @import("header.zig");
+const jobrun = @import("jobrun.zig");
 const limits = @import("limits.zig");
 const trie_mod = @import("trie.zig");
 const word = @import("u256.zig");
@@ -106,10 +107,15 @@ pub fn run_path(
     path: []const u8,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    jobs: u32,
 ) !Summary {
     const st = try std.Io.Dir.cwd().statFile(io, path, .{});
-    if (st.kind == .directory) return run_dir(allocator, io, path, writer, fork);
-    return run_file(allocator, io, std.Io.Dir.cwd(), path, writer, fork);
+    if (st.kind == .directory) return run_dir(allocator, io, path, writer, fork, jobs);
+    const vm = try allocator.create(evm.Vm);
+    defer allocator.destroy(vm);
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    return run_file(allocator, io, std.Io.Dir.cwd(), path, writer, fork, vm, trie);
 }
 
 pub fn run_dir(
@@ -118,7 +124,24 @@ pub fn run_dir(
     dir_path: []const u8,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    jobs: u32,
 ) !Summary {
+    const n = jobrun.resolve_jobs(jobs);
+    if (n > 1) return run_dir_jobs(allocator, io, dir_path, writer, fork, n);
+    return run_dir_serial(allocator, io, dir_path, writer, fork);
+}
+
+fn run_dir_serial(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    writer: *std.Io.Writer,
+    fork: evm.Fork,
+) !Summary {
+    const vm = try allocator.create(evm.Vm);
+    defer allocator.destroy(vm);
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
     var walker = try dir.walk(allocator);
@@ -127,10 +150,122 @@ pub fn run_dir(
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".json")) continue;
-        const file = try run_file(allocator, io, entry.dir, entry.basename, writer, fork);
+        const file = try run_file(allocator, io, entry.dir, entry.basename, writer, fork, vm, trie);
         add_summary(&summary, file);
     }
     return summary;
+}
+
+const Job = struct {
+    io: std.Io,
+    fork: evm.Fork,
+    paths: []const []const u8,
+    next: *std.atomic.Value(usize),
+    io_mutex: *jobrun.Mutex,
+    writer: *std.Io.Writer,
+    writer_mutex: *jobrun.Mutex,
+    summary: *Summary,
+    summary_mutex: *jobrun.Mutex,
+};
+
+fn run_dir_jobs(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    writer: *std.Io.Writer,
+    fork: evm.Fork,
+    jobs: u32,
+) !Summary {
+    const paths = try jobrun.collect_json_files(allocator, io, dir_path);
+    defer jobrun.free_paths(allocator, paths);
+    if (paths.len == 0) return .{};
+    const n: u32 = @intCast(@min(@as(usize, jobs), paths.len));
+    var next = std.atomic.Value(usize).init(0);
+    var io_mutex: jobrun.Mutex = jobrun.mutex_init;
+    var writer_mutex: jobrun.Mutex = jobrun.mutex_init;
+    var summary_mutex: jobrun.Mutex = jobrun.mutex_init;
+    var summary = Summary{};
+    var job = Job{
+        .io = io,
+        .fork = fork,
+        .paths = paths,
+        .next = &next,
+        .io_mutex = &io_mutex,
+        .writer = writer,
+        .writer_mutex = &writer_mutex,
+        .summary = &summary,
+        .summary_mutex = &summary_mutex,
+    };
+    const threads = try allocator.alloc(std.Thread, n);
+    defer allocator.free(threads);
+    var spawned: u32 = 0;
+    errdefer {
+        var i: u32 = 0;
+        while (i < spawned) : (i += 1) threads[i].join();
+    }
+    while (spawned < n) : (spawned += 1) {
+        threads[spawned] = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, worker, .{&job});
+    }
+    var i: u32 = 0;
+    while (i < spawned) : (i += 1) threads[i].join();
+    return summary;
+}
+
+fn worker(job: *Job) void {
+    var heap: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = heap.deinit();
+    const gpa = heap.allocator();
+    const vm = gpa.create(evm.Vm) catch return;
+    defer gpa.destroy(vm);
+    const trie = gpa.create(trie_mod.Trie) catch return;
+    defer gpa.destroy(trie);
+    const out_buf = gpa.alloc(u8, 8 * 1024 * 1024) catch return;
+    defer gpa.free(out_buf);
+    while (true) {
+        const index = job.next.fetchAdd(1, .monotonic);
+        if (index >= job.paths.len) break;
+        const path = job.paths[index];
+        jobrun.lock(job.io_mutex);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            job.io,
+            path,
+            gpa,
+            .limited(limits.jsontest_bytes_max),
+        ) catch |err| {
+            jobrun.unlock(job.io_mutex);
+            var local = std.Io.Writer.fixed(out_buf);
+            if (err == error.StreamTooLong) {
+                local.print("{s} skip too-large\n", .{path}) catch {};
+                flush_file(job, local.buffered(), .{ .skipped = 1 });
+            } else {
+                local.print("{s} fail read: {s}\n", .{ path, @errorName(err) }) catch {};
+                flush_file(job, local.buffered(), .{ .failed = 1 });
+            }
+            continue;
+        };
+        jobrun.unlock(job.io_mutex);
+        defer gpa.free(bytes);
+        var local = std.Io.Writer.fixed(out_buf);
+        const file = run_json_with(gpa, bytes, &local, job.fork, vm, trie) catch |err| blk: {
+            if (!looks_like_state_test(bytes)) {
+                local.print("{s} skip not-state-test\n", .{path}) catch {};
+                break :blk Summary{ .skipped = 1 };
+            }
+            local.print("{s} fail parse: {s}\n", .{ path, @errorName(err) }) catch {};
+            break :blk Summary{ .failed = 1 };
+        };
+        flush_file(job, local.buffered(), file);
+    }
+}
+
+fn flush_file(job: *Job, text: []const u8, file: Summary) void {
+    jobrun.lock(job.writer_mutex);
+    job.writer.writeAll(text) catch {};
+    job.writer.flush() catch {};
+    jobrun.unlock(job.writer_mutex);
+    jobrun.lock(job.summary_mutex);
+    add_summary(job.summary, file);
+    jobrun.unlock(job.summary_mutex);
 }
 
 pub fn run_json(
@@ -139,6 +274,21 @@ pub fn run_json(
     writer: *std.Io.Writer,
     fork: evm.Fork,
 ) !Summary {
+    const vm = try allocator.create(evm.Vm);
+    defer allocator.destroy(vm);
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    return run_json_with(allocator, json, writer, fork, vm, trie);
+}
+
+fn run_json_with(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    writer: *std.Io.Writer,
+    fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
+) !Summary {
     var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(JsonTest), allocator, json, .{
         .ignore_unknown_fields = true,
     });
@@ -146,7 +296,7 @@ pub fn run_json(
     var summary = Summary{};
     var it = parsed.value.map.iterator();
     while (it.next()) |kv| {
-        try run_named(allocator, kv.key_ptr.*, kv.value_ptr, writer, fork, &summary);
+        try run_named(allocator, kv.key_ptr.*, kv.value_ptr, writer, fork, vm, trie, &summary);
     }
     return summary;
 }
@@ -158,6 +308,8 @@ fn run_file(
     path: []const u8,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
 ) !Summary {
     const bytes = dir.readFileAlloc(io, path, allocator, .limited(limits.jsontest_bytes_max)) catch |err| {
         if (err == error.StreamTooLong) {
@@ -167,7 +319,7 @@ fn run_file(
         return err;
     };
     defer allocator.free(bytes);
-    return run_json(allocator, bytes, writer, fork) catch |err| {
+    return run_json_with(allocator, bytes, writer, fork, vm, trie) catch |err| {
         if (!looks_like_state_test(bytes)) {
             try writer.print("{s} skip not-state-test\n", .{path});
             return .{ .skipped = 1 };
@@ -188,6 +340,8 @@ fn run_named(
     fixture: *const JsonTest,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
     summary: *Summary,
 ) !void {
     if (fixture.pre.map.count() == 0) return;
@@ -205,10 +359,21 @@ fn run_named(
         return;
     }
     const cases = fixture.post.map.get(post_key).?;
+    const exec_fork = fixture_fork(post_key) orelse {
+        try writer.print("{s} skip fork\n", .{name});
+        try writer.flush();
+        summary.skipped += 1;
+        return;
+    };
     for (cases) |case| {
         var id_buf: [512]u8 = undefined;
         const id = case_id(&id_buf, name, post_key, case.indexes);
-        const outcome = run_case(allocator, fixture, case, fork) catch .fail;
+        const outcome = run_case(allocator, fixture, case, exec_fork, vm, trie) catch |err| {
+            try writer.print("{s} fail {s}\n", .{ id, @errorName(err) });
+            try writer.flush();
+            summary.failed += 1;
+            continue;
+        };
         try writer.print("{s} {s}\n", .{ id, @tagName(outcome) });
         try writer.flush();
         tally(summary, outcome);
@@ -253,41 +418,11 @@ fn is_before(name: []const u8, fork_name: []const u8) bool {
     return rank < bound;
 }
 
-fn is_pre_cancun(name: []const u8) bool {
-    return is_before(name, "cancun");
-}
-
-/// Osaka VM vs a post from an older fork whose rule we no longer follow.
+/// Pre-Paris (pre-merge) posts are skipped: no pre-merge sync.
 fn skip_reason(test_name: []const u8, post_key: []const u8) ?[]const u8 {
-    if (skip_old_selfdestruct(test_name, post_key)) return "pre-cancun-selfdestruct";
-    if (skip_before_fork(test_name, post_key)) return "before-fork";
-    if (std.mem.indexOf(u8, test_name, "create_one_byte") != null and is_before(post_key, "london")) {
-        return "pre-london-ef";
-    }
-    if (std.mem.indexOf(u8, test_name, "create_deposit_oog") != null and is_before(post_key, "tangerinewhistle")) {
-        return "pre-eip150-create";
-    }
-    if (std.mem.indexOf(u8, test_name, "eip3651") != null and is_before(post_key, "shanghai")) {
-        return "pre-shanghai-warm-coinbase";
-    }
-    if (std.mem.indexOf(u8, test_name, "eip7883") != null and is_before(post_key, "osaka")) {
-        return "pre-osaka-modexp-gas";
-    }
+    _ = test_name;
+    if (is_before(post_key, "paris")) return "pre-paris";
     return null;
-}
-
-/// EIP-6780 is Osaka SELFDESTRUCT. Pre-Cancun posts expect the old opcode.
-fn skip_old_selfdestruct(test_name: []const u8, post_key: []const u8) bool {
-    if (!is_pre_cancun(post_key)) return false;
-    return std.mem.indexOf(u8, test_name, "eip6780") != null or
-        std.mem.indexOf(u8, test_name, "selfdestruct") != null or
-        std.mem.indexOf(u8, test_name, "SELFDESTRUCT") != null;
-}
-
-/// Osaka implements the opcode; Shanghai posts expect INVALID.
-fn skip_before_fork(test_name: []const u8, post_key: []const u8) bool {
-    if (!is_pre_cancun(post_key)) return false;
-    return std.mem.indexOf(u8, test_name, "before_fork") != null;
 }
 
 fn run_case(
@@ -295,6 +430,8 @@ fn run_case(
     fixture: *const JsonTest,
     case: JsonPostCase,
     fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
 ) !Outcome {
     if (has_exception(case)) return .skip;
     const state = state_map(&case, fixture);
@@ -319,6 +456,8 @@ fn run_case(
         gas_limit,
         value,
         case.indexes.data,
+        vm,
+        trie,
     );
 }
 
@@ -332,15 +471,15 @@ fn apply_and_check(
     gas_limit: u64,
     value: u256,
     data_index: u32,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
 ) !Outcome {
-    const vm = try allocator.create(evm.Vm);
-    defer allocator.destroy(vm);
     vm.init_plain(fork);
     try load_pre(&vm.world, &fixture.pre);
     vm.world.journal_count = 0;
     const sender = try sender_of(fixture.transaction);
     try bind_env(vm, fixture, sender);
-    try fill_block_hashes(allocator, vm);
+    try fill_block_hashes(trie, vm);
     const access = try parse_access_list(allocator, fixture.transaction.accessLists, data_index);
     defer free_access_list(allocator, access);
     vm.access_list = access;
@@ -350,21 +489,20 @@ fn apply_and_check(
     const blobs = try parse_blob_hashes(allocator, fixture.transaction.blobVersionedHashes);
     defer if (blobs.len != 0) allocator.free(blobs);
     vm.blob_versioned_hashes = blobs;
+    vm.max_fee_per_gas = try tx_fee_cap(fixture.transaction, vm.env.gas_price);
     vm.max_fee_per_blob_gas = try parse_u256(fixture.transaction.maxFeePerBlobGas);
     const to = try call_target(fixture.transaction.to);
-    _ = vm.apply_tx(to, data, gas_limit, value, sender) catch return .fail;
+    _ = try vm.apply_tx(to, data, gas_limit, value, sender);
     if (state) |expected| {
-        check_state(&vm.world, expected) catch return .fail;
+        try check_state(&vm.world, expected);
     }
     if (want_root) |root| {
-        check_root(allocator, &vm.world, root) catch return .fail;
+        try check_root(trie, &vm.world, root);
     }
     return .pass;
 }
 
-fn fill_block_hashes(allocator: std.mem.Allocator, vm: *evm.Vm) !void {
-    const trie = try allocator.create(trie_mod.Trie);
-    defer allocator.destroy(trie);
+fn fill_block_hashes(trie: *trie_mod.Trie, vm: *evm.Vm) !void {
     trie.reset();
     const pre_root = try trie.world_root(&vm.world);
     vm.block_hash_count = header_mod.fill_window(
@@ -379,9 +517,7 @@ fn fill_block_hashes(allocator: std.mem.Allocator, vm: *evm.Vm) !void {
     );
 }
 
-fn check_root(allocator: std.mem.Allocator, world: *const world_mod.World, want: [32]u8) !void {
-    const trie = try allocator.create(trie_mod.Trie);
-    defer allocator.destroy(trie);
+fn check_root(trie: *trie_mod.Trie, world: *const world_mod.World, want: [32]u8) !void {
     trie.reset();
     const got = try trie.world_root(world);
     if (!std.mem.eql(u8, &got, &want)) return error.StateRootMismatch;
@@ -402,16 +538,15 @@ fn has_exception(case: JsonPostCase) bool {
 }
 
 /// Map an EEST post-state fork name onto a zig-evm fork table.
-/// Pre-Prague names run on the Prague table (oldest we have).
 fn fixture_fork(name: []const u8) ?evm.Fork {
+    if (std.ascii.eqlIgnoreCase(name, "merge")) return .paris;
     if (evm.Fork.from_name(name)) |fork| return fork;
-    const pre_prague = [_][]const u8{
+    const pre_paris = [_][]const u8{
         "frontier", "homestead", "byzantium", "constantinople", "petersburg",
-        "istanbul", "berlin",    "london",    "paris",          "merge",
-        "shanghai", "cancun",
+        "istanbul", "berlin",    "london",
     };
-    for (pre_prague) |fork_name| {
-        if (std.ascii.eqlIgnoreCase(name, fork_name)) return .prague;
+    for (pre_paris) |fork_name| {
+        if (std.ascii.eqlIgnoreCase(name, fork_name)) return .paris;
     }
     return null;
 }
@@ -427,7 +562,7 @@ fn load_account(world: *world_mod.World, addr_text: []const u8, account: *const 
     const addr = try parse_address(addr_text);
     try world.set_balance(addr, try parse_u256(account.balance));
     try world.set_nonce(addr, try parse_u64(account.nonce));
-    var code_buf: [limits.code_bytes_max]u8 = undefined;
+    var code_buf: [limits.forge_code_bytes_max]u8 = undefined;
     const n = try parse_hex_into(account.code, &code_buf);
     if (n != 0) try world.set_code(addr, code_buf[0..n]);
     var it = account.storage.map.iterator();
@@ -446,7 +581,7 @@ fn bind_env(vm: *evm.Vm, fixture: *const JsonTest, sender: u256) !void {
     vm.env.base_fee = try parse_u256(env.currentBaseFee);
     vm.env.prev_randao = try parse_u256(randao);
     vm.env.chain_id = try parse_u256(fixture.config.chainid);
-    vm.env.blob_base_fee = gas_mod.blob_base_fee(try parse_u256(env.currentExcessBlobGas));
+    vm.env.blob_base_fee = gas_mod.blob_base_fee_on(try parse_u256(env.currentExcessBlobGas), vm.fork);
     vm.env.gas_price = try tx_effective_gas_price(fixture.transaction, vm.env.base_fee);
     vm.env.origin = sender;
     vm.env.caller = sender;
@@ -469,10 +604,8 @@ fn check_account(
 ) !void {
     const addr = try parse_address(addr_text);
     if (world.get_nonce(addr) != try parse_u64(account.nonce)) return error.NonceMismatch;
-    if (world.get_balance(addr) != try parse_u256(account.balance)) {
-        return error.BalanceMismatch;
-    }
-    var code_buf: [limits.code_bytes_max]u8 = undefined;
+    if (world.get_balance(addr) != try parse_u256(account.balance)) return error.BalanceMismatch;
+    var code_buf: [limits.forge_code_bytes_max]u8 = undefined;
     const n = try parse_hex_into(account.code, &code_buf);
     if (!std.mem.eql(u8, world.code_of(addr), code_buf[0..n])) return error.CodeMismatch;
     try check_storage(world, addr, &account.storage);
@@ -595,6 +728,12 @@ fn tx_effective_gas_price(tx: JsonTx, base_fee: u256) !u256 {
     const max_prio = try parse_u256(tx.maxPriorityFeePerGas);
     if (max_fee < base_fee) return max_fee;
     return base_fee + @min(max_prio, max_fee - base_fee);
+}
+
+fn tx_fee_cap(tx: JsonTx, effective: u256) !u256 {
+    if (!is_blank_hex(tx.maxFeePerGas)) return parse_u256(tx.maxFeePerGas);
+    if (!is_blank_hex(tx.gasPrice)) return parse_u256(tx.gasPrice);
+    return effective;
 }
 
 fn address_from_key(pk: [32]u8) ?u256 {
@@ -747,25 +886,36 @@ test "osaka-only fixture skips on prague" {
     try std.testing.expectEqual(@as(u32, 0), summary.passed);
 }
 
-test "eip6780 prefers cancun over shanghai and skips pre-cancun posts" {
+test "berlin-only fixture skips as pre-paris" {
+    const json =
+        \\{"oldFork":{
+        \\"env":{"currentCoinbase":"0x00","currentGasLimit":"0x01","currentNumber":"0x01","currentTimestamp":"0x01"},
+        \\"pre":{"0x01":{"balance":"0x01","code":"0x","nonce":"0x00","storage":{}}},
+        \\"transaction":{"data":["0x"],"gasLimit":["0x5208"],"gasPrice":"0x01","nonce":"0x00","sender":"0x01","to":"0x01","value":["0x00"]},
+        \\"post":{"Berlin":[{"hash":"0x00","indexes":{"data":0,"gas":0,"value":0},"state":{}}]}
+        \\}}
+    ;
+    const summary = try with_writer(json, .osaka);
+    try std.testing.expectEqual(@as(u32, 1), summary.skipped);
+    try std.testing.expectEqual(@as(u32, 0), summary.passed);
+}
+
+test "post keys map onto real forks and pre-paris still skips" {
     try std.testing.expect(network_rank("cancun").? > network_rank("shanghai").?);
-    try std.testing.expect(is_pre_cancun("Shanghai"));
-    try std.testing.expect(!is_pre_cancun("Cancun"));
-    try std.testing.expect(!is_pre_cancun("Osaka"));
-    try std.testing.expect(skip_old_selfdestruct("eip6780_selfdestruct_pre_existing", "Shanghai"));
-    try std.testing.expect(!skip_old_selfdestruct("eip6780_selfdestruct_pre_existing", "Osaka"));
-    try std.testing.expect(!skip_old_selfdestruct("eip3855_push0", "Shanghai"));
-    try std.testing.expect(skip_before_fork("test_blobbasefee_before_fork", "Shanghai"));
-    try std.testing.expect(!skip_before_fork("test_blobbasefee_before_fork", "Cancun"));
-    try std.testing.expect(!skip_before_fork("test_blobbasefee_out_of_gas", "Shanghai"));
-    try std.testing.expectEqualStrings("pre-london-ef", skip_reason("create_one_byte", "Istanbul").?);
-    try std.testing.expect(skip_reason("create_one_byte", "London") == null);
-    try std.testing.expectEqualStrings("pre-eip150-create", skip_reason("create_deposit_oog", "Frontier").?);
-    try std.testing.expect(skip_reason("create_deposit_oog", "Berlin") == null);
-    try std.testing.expectEqualStrings("pre-shanghai-warm-coinbase", skip_reason("eip3651_warm_coinbase", "Paris").?);
-    try std.testing.expect(skip_reason("eip3651_warm_coinbase", "Shanghai") == null);
-    try std.testing.expectEqualStrings("pre-osaka-modexp-gas", skip_reason("eip7883_modexp_gas_increase", "Prague").?);
-    try std.testing.expect(skip_reason("eip7883_modexp_gas_increase", "Osaka") == null);
+    try std.testing.expectEqual(evm.Fork.paris, fixture_fork("Paris").?);
+    try std.testing.expectEqual(evm.Fork.paris, fixture_fork("Merge").?);
+    try std.testing.expectEqual(evm.Fork.shanghai, fixture_fork("Shanghai").?);
+    try std.testing.expectEqual(evm.Fork.cancun, fixture_fork("Cancun").?);
+    try std.testing.expectEqual(evm.Fork.prague, fixture_fork("Prague").?);
+    try std.testing.expectEqualStrings("pre-paris", skip_reason("test_all_opcodes", "Frontier").?);
+    try std.testing.expectEqualStrings("pre-paris", skip_reason("test_all_opcodes", "London").?);
+    try std.testing.expect(skip_reason("test_all_opcodes", "Paris") == null);
+    try std.testing.expect(skip_reason("test_all_opcodes", "Merge") == null);
+    try std.testing.expect(skip_reason("eip3651_warm_coinbase", "Paris") == null);
+    try std.testing.expect(skip_reason("eip6780_selfdestruct_pre_existing", "Shanghai") == null);
+    try std.testing.expect(skip_reason("test_all_opcodes", "Cancun") == null);
+    try std.testing.expect(skip_reason("test_all_opcodes", "Osaka") == null);
+    try std.testing.expect(skip_reason("eip7883_modexp_gas_increase", "Prague") == null);
 }
 
 test "wrong storage fails" {

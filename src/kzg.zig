@@ -22,6 +22,7 @@ const bls_modulus = [_]u8{
 
 var settings_cell: c.KZGSettings = undefined;
 var settings_ready: bool = false;
+var settings_mu: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
 
 pub fn execute(input: []const u8, out: []u8) error{ OutputTooLarge, PrecompileFailed }!u32 {
     if (input.len != input_len) return error.PrecompileFailed;
@@ -61,6 +62,8 @@ fn versioned_hash(commitment: *const [48]u8) [32]u8 {
 }
 
 fn settings() *const c.KZGSettings {
+    _ = std.c.pthread_mutex_lock(&settings_mu);
+    defer _ = std.c.pthread_mutex_unlock(&settings_mu);
     if (!settings_ready) {
         load_settings() catch |err| std.debug.panic("kzg trusted setup: {s}", .{@errorName(err)});
         settings_ready = true;

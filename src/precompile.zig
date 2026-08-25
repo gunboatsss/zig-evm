@@ -37,8 +37,17 @@ pub const bls_map_g2_address: u256 = 17;
 pub const p256verify_address: u256 = 0x100;
 
 pub fn is_precompile(address: u256, fork: Fork) bool {
-    if (address >= 1 and address <= 17) return true;
+    if (address >= 1 and address <= 9) return true;
+    if (address == kzg_address) return fork.at_least(.cancun);
+    if (address >= 11 and address <= 17) return fork.at_least(.prague);
     return address == p256verify_address and fork.at_least(.osaka);
+}
+
+/// Highest precompile in `1..=17` that exists on `fork`.
+pub fn last_warm_precompile(fork: Fork) u256 {
+    if (fork.at_least(.prague)) return 17;
+    if (fork.at_least(.cancun)) return 10;
+    return 9;
 }
 
 pub fn gas_cost(address: u256, input: []const u8, fork: Fork) error{OutOfGas}!u64 {
@@ -267,6 +276,20 @@ test "p256verify rejects short input" {
     var out: [32]u8 = undefined;
     const n = try exec_p256verify(&[_]u8{ 1, 2, 3 }, &out);
     try std.testing.expectEqual(@as(u32, 0), n);
+}
+
+test "precompile addresses follow the fork" {
+    try std.testing.expect(is_precompile(1, .paris));
+    try std.testing.expect(is_precompile(9, .paris));
+    try std.testing.expect(!is_precompile(10, .shanghai));
+    try std.testing.expect(is_precompile(10, .cancun));
+    try std.testing.expect(!is_precompile(11, .cancun));
+    try std.testing.expect(is_precompile(11, .prague));
+    try std.testing.expect(!is_precompile(p256verify_address, .prague));
+    try std.testing.expect(is_precompile(p256verify_address, .osaka));
+    try std.testing.expectEqual(@as(u256, 9), last_warm_precompile(.paris));
+    try std.testing.expectEqual(@as(u256, 10), last_warm_precompile(.cancun));
+    try std.testing.expectEqual(@as(u256, 17), last_warm_precompile(.prague));
 }
 
 fn hex32(text: *const [64]u8) [32]u8 {

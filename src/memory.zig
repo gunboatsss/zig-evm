@@ -57,6 +57,29 @@ pub const Memory = struct {
         self.bytes[offset] = byte;
     }
 
+    /// Length 0 is a no-op even when `offset` does not fit in `u32`.
+    pub fn expand_range(self: *Memory, offset: u256, length: u256) !void {
+        if (length == 0) return;
+        if (offset > std.math.maxInt(u32)) return error.MemoryOverflow;
+        if (length > std.math.maxInt(u32)) return error.MemoryOverflow;
+        try self.expand(@intCast(offset), @intCast(length));
+    }
+
+    /// Copy `length` bytes from `source[src..]` into memory at `dest`,
+    /// zero-padding when `src` is past the end or overflows.
+    pub fn write_from(self: *Memory, dest: u256, src: u256, length: u256, source: []const u8) !void {
+        try self.expand_range(dest, length);
+        if (length == 0) return;
+        const dest_off: u32 = @intCast(dest);
+        const len: u32 = @intCast(length);
+        var index: u32 = 0;
+        while (index < len) : (index += 1) {
+            const src_i = @addWithOverflow(src, @as(u256, index));
+            const byte: u8 = if (src_i[1] == 1 or src_i[0] >= source.len) 0 else source[@intCast(src_i[0])];
+            self.bytes[dest_off + index] = byte;
+        }
+    }
+
     pub fn copy(self: *Memory, dest_offset: u32, src_offset: u32, length: u32) !void {
         try self.expand(dest_offset, length);
         try self.expand(src_offset, length);
@@ -83,18 +106,26 @@ pub const Memory = struct {
         @memcpy(out[0..length], self.bytes[offset .. offset + length]);
     }
 
+    /// Slice of expanded memory. Length 0 is empty even when `offset` is huge.
+    pub fn span(self: *Memory, offset: u256, length: u256) []u8 {
+        if (length == 0) return self.bytes[0..0];
+        const off: u32 = @intCast(offset);
+        const len: u32 = @intCast(length);
+        return self.bytes[off .. off + len];
+    }
+
     fn align_up_32(value: u32) u32 {
         const remainder = value % 32;
         if (remainder == 0) return value;
         return value + (32 - remainder);
     }
-
-    fn add_u32(a: u32, b: u32) ?u32 {
-        const sum = @addWithOverflow(a, b);
-        if (sum[1] == 1) return null;
-        return sum[0];
-    }
 };
+
+pub fn add_u32(a: u32, b: u32) ?u32 {
+    const sum = @addWithOverflow(a, b);
+    if (sum[1] == 1) return null;
+    return sum[0];
+}
 
 /// End of a copy range. Length 0 does not expand. Overflow is OutOfGas.
 pub fn range_end(offset: u256, length: u256) !u256 {
@@ -104,12 +135,11 @@ pub fn range_end(offset: u256, length: u256) !u256 {
     return sum[0];
 }
 
-pub fn expansion_end(current: u32, dest: u256, src: u256, length: u256) !u32 {
+/// 32-byte-aligned end after growing `current` for one `(offset, length)` range.
+pub fn grow_end(current: u32, offset: u256, length: u256) !u32 {
     var end: u256 = current;
-    const dest_end = try range_end(dest, length);
-    const src_end = try range_end(src, length);
-    if (dest_end > end) end = dest_end;
-    if (src_end > end) end = src_end;
+    const range = try range_end(offset, length);
+    if (range > end) end = range;
     const rem = end % 32;
     if (rem != 0) {
         const aligned = @addWithOverflow(end, 32 - rem);
@@ -118,6 +148,22 @@ pub fn expansion_end(current: u32, dest: u256, src: u256, length: u256) !u32 {
     }
     if (end > std.math.maxInt(u32)) return error.OutOfGas;
     return @intCast(end);
+}
+
+pub fn expansion_end(current: u32, dest: u256, src: u256, length: u256) !u32 {
+    const after_dest = try grow_end(current, dest, length);
+    return grow_end(after_dest, src, length);
+}
+
+pub fn expansion_union(
+    current: u32,
+    a_off: u256,
+    a_len: u256,
+    b_off: u256,
+    b_len: u256,
+) !u32 {
+    const after_a = try grow_end(current, a_off, a_len);
+    return grow_end(after_a, b_off, b_len);
 }
 
 test "memory store load" {
@@ -137,6 +183,17 @@ test "expand length zero does not grow" {
 test "expansion end zero length stays current" {
     try std.testing.expectEqual(@as(u32, 0), try expansion_end(0, 32, 0, 0));
     try std.testing.expectEqual(@as(u32, 0), try expansion_end(0, std.math.maxInt(u256), 0, 0));
+    try std.testing.expectEqual(@as(u32, 0), try grow_end(0, std.math.maxInt(u256), 0));
+}
+
+test "write_from huge src zero-pads" {
+    var buffer: [256]u8 = undefined;
+    var memory = Memory.init(&buffer);
+    try memory.write_from(0, std.math.maxInt(u256) - 5, 4, "abcd");
+    try std.testing.expectEqual(@as(u8, 0), memory.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0), memory.bytes[3]);
+    try memory.write_from(0, std.math.maxInt(u256), 0, "abcd");
+    try std.testing.expectEqual(@as(u32, 32), memory.size());
 }
 
 test "expand past 1 MiB succeeds within the frame cap" {
@@ -146,4 +203,10 @@ test "expand past 1 MiB succeeds within the frame cap" {
     var memory = Memory.init(buf);
     try memory.expand(cap - 32, 32);
     try std.testing.expectEqual(cap, memory.size());
+}
+
+test "add_u32 overflow is null" {
+    try std.testing.expectEqual(@as(?u32, 5), add_u32(2, 3));
+    try std.testing.expect(add_u32(std.math.maxInt(u32), 1) == null);
+    try std.testing.expect(add_u32(std.math.maxInt(u32), 2) == null);
 }

@@ -57,9 +57,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    const jobs_opt = b.option(u32, "jobs", "jsontest/chaintest worker threads (0 = CPU count)");
+
     const run_jsontest = b.addRunArtifact(exe);
     run_jsontest.setCwd(b.path("."));
     run_jsontest.addArg("jsontest");
+    if (jobs_opt) |n| {
+        run_jsontest.addArg("--jobs");
+        run_jsontest.addArg(b.fmt("{d}", .{n}));
+    }
     if (b.option([]const u8, "jsontest-path", "EEST JSON file or directory")) |path| {
         run_jsontest.addArg(path);
     }
@@ -69,6 +75,10 @@ pub fn build(b: *std.Build) void {
     const run_chaintest = b.addRunArtifact(exe);
     run_chaintest.setCwd(b.path("."));
     run_chaintest.addArg("chaintest");
+    if (jobs_opt) |n| {
+        run_chaintest.addArg("--jobs");
+        run_chaintest.addArg(b.fmt("{d}", .{n}));
+    }
     if (b.option([]const u8, "chaintest-path", "EEST blockchain JSON file or directory")) |path| {
         run_chaintest.addArg(path);
     }

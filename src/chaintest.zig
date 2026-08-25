@@ -1,14 +1,16 @@
 //! EEST `blockchain_tests` JSON runner.
 //!
-//! Valid Osaka blocks first: skip `expectException` and uncles.
-//! Transaction / receipt tries are copied from the fixture so
-//! header hashing still matches when `stateRoot` and `gasUsed` are right.
+//! Valid Osaka blocks first. `expectException` blocks must fail to apply.
+//! Transaction / receipt / withdrawal tries and logs bloom are computed
+//! and checked when the fixture provides those header fields.
 
 const std = @import("std");
 const evm = @import("evm.zig");
 const header_mod = @import("header.zig");
+const jobrun = @import("jobrun.zig");
 const limits = @import("limits.zig");
 const trie_mod = @import("trie.zig");
+const block_mod = @import("block.zig");
 const word = @import("u256.zig");
 const world_mod = @import("world.zig");
 
@@ -81,6 +83,8 @@ const JsonTx = struct {
     type: []const u8 = "0x00",
     sender: []const u8 = "",
     secretKey: []const u8 = "",
+    nonce: []const u8 = "0x00",
+    chainId: []const u8 = "",
     to: ?[]const u8 = null,
     data: []const u8 = "0x",
     gasLimit: []const u8 = "0x00",
@@ -89,6 +93,10 @@ const JsonTx = struct {
     maxFeePerGas: []const u8 = "",
     maxPriorityFeePerGas: []const u8 = "",
     maxFeePerBlobGas: []const u8 = "",
+    v: []const u8 = "0x00",
+    r: []const u8 = "0x00",
+    s: []const u8 = "0x00",
+    yParity: []const u8 = "",
     accessList: []const JsonAccess = &.{},
     authorizationList: []const JsonAuth = &.{},
     blobVersionedHashes: []const []const u8 = &.{},
@@ -130,10 +138,17 @@ pub fn run_path(
     path: []const u8,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    jobs: u32,
 ) !Summary {
     const st = try std.Io.Dir.cwd().statFile(io, path, .{});
-    if (st.kind == .directory) return run_dir(allocator, io, path, writer, fork);
-    return run_file(allocator, io, std.Io.Dir.cwd(), path, writer, fork);
+    if (st.kind == .directory) return run_dir(allocator, io, path, writer, fork, jobs);
+    const vm = try allocator.create(evm.Vm);
+    defer allocator.destroy(vm);
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    const receipts = try allocator.create(block_mod.Receipts);
+    defer allocator.destroy(receipts);
+    return run_file(allocator, io, std.Io.Dir.cwd(), path, writer, fork, vm, trie, receipts);
 }
 
 pub fn run_dir(
@@ -142,7 +157,26 @@ pub fn run_dir(
     dir_path: []const u8,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    jobs: u32,
 ) !Summary {
+    const n = jobrun.resolve_jobs(jobs);
+    if (n > 1) return run_dir_jobs(allocator, io, dir_path, writer, fork, n);
+    return run_dir_serial(allocator, io, dir_path, writer, fork);
+}
+
+fn run_dir_serial(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    writer: *std.Io.Writer,
+    fork: evm.Fork,
+) !Summary {
+    const vm = try allocator.create(evm.Vm);
+    defer allocator.destroy(vm);
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    const receipts = try allocator.create(block_mod.Receipts);
+    defer allocator.destroy(receipts);
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
     var walker = try dir.walk(allocator);
@@ -151,10 +185,124 @@ pub fn run_dir(
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".json")) continue;
-        const file = try run_file(allocator, io, entry.dir, entry.basename, writer, fork);
+        const file = try run_file(allocator, io, entry.dir, entry.basename, writer, fork, vm, trie, receipts);
         add_summary(&summary, file);
     }
     return summary;
+}
+
+const Job = struct {
+    io: std.Io,
+    fork: evm.Fork,
+    paths: []const []const u8,
+    next: *std.atomic.Value(usize),
+    io_mutex: *jobrun.Mutex,
+    writer: *std.Io.Writer,
+    writer_mutex: *jobrun.Mutex,
+    summary: *Summary,
+    summary_mutex: *jobrun.Mutex,
+};
+
+fn run_dir_jobs(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    writer: *std.Io.Writer,
+    fork: evm.Fork,
+    jobs: u32,
+) !Summary {
+    const paths = try jobrun.collect_json_files(allocator, io, dir_path);
+    defer jobrun.free_paths(allocator, paths);
+    if (paths.len == 0) return .{};
+    const n: u32 = @intCast(@min(@as(usize, jobs), paths.len));
+    var next = std.atomic.Value(usize).init(0);
+    var io_mutex: jobrun.Mutex = jobrun.mutex_init;
+    var writer_mutex: jobrun.Mutex = jobrun.mutex_init;
+    var summary_mutex: jobrun.Mutex = jobrun.mutex_init;
+    var summary = Summary{};
+    var job = Job{
+        .io = io,
+        .fork = fork,
+        .paths = paths,
+        .next = &next,
+        .io_mutex = &io_mutex,
+        .writer = writer,
+        .writer_mutex = &writer_mutex,
+        .summary = &summary,
+        .summary_mutex = &summary_mutex,
+    };
+    const threads = try allocator.alloc(std.Thread, n);
+    defer allocator.free(threads);
+    var spawned: u32 = 0;
+    errdefer {
+        var i: u32 = 0;
+        while (i < spawned) : (i += 1) threads[i].join();
+    }
+    while (spawned < n) : (spawned += 1) {
+        threads[spawned] = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, worker, .{&job});
+    }
+    var i: u32 = 0;
+    while (i < spawned) : (i += 1) threads[i].join();
+    return summary;
+}
+
+fn worker(job: *Job) void {
+    var heap: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = heap.deinit();
+    const gpa = heap.allocator();
+    const vm = gpa.create(evm.Vm) catch return;
+    defer gpa.destroy(vm);
+    const trie = gpa.create(trie_mod.Trie) catch return;
+    defer gpa.destroy(trie);
+    const receipts = gpa.create(block_mod.Receipts) catch return;
+    defer gpa.destroy(receipts);
+    const out_buf = gpa.alloc(u8, 8 * 1024 * 1024) catch return;
+    defer gpa.free(out_buf);
+    while (true) {
+        const index = job.next.fetchAdd(1, .monotonic);
+        if (index >= job.paths.len) break;
+        const path = job.paths[index];
+        jobrun.lock(job.io_mutex);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            job.io,
+            path,
+            gpa,
+            .limited(limits.jsontest_bytes_max),
+        ) catch |err| {
+            jobrun.unlock(job.io_mutex);
+            var local = std.Io.Writer.fixed(out_buf);
+            if (err == error.StreamTooLong) {
+                local.print("{s} skip too-large\n", .{path}) catch {};
+                flush_file(job, local.buffered(), .{ .skipped = 1 });
+            } else {
+                local.print("{s} fail read: {s}\n", .{ path, @errorName(err) }) catch {};
+                flush_file(job, local.buffered(), .{ .failed = 1 });
+            }
+            continue;
+        };
+        jobrun.unlock(job.io_mutex);
+        defer gpa.free(bytes);
+        var local = std.Io.Writer.fixed(out_buf);
+        const file = run_json_with(gpa, bytes, &local, job.fork, vm, trie, receipts) catch |err| blk: {
+            if (!looks_like_chain_test(bytes)) {
+                local.print("{s} skip not-blockchain-test\n", .{path}) catch {};
+                break :blk Summary{ .skipped = 1 };
+            }
+            local.print("{s} fail parse: {s}\n", .{ path, @errorName(err) }) catch {};
+            break :blk Summary{ .failed = 1 };
+        };
+        flush_file(job, local.buffered(), file);
+    }
+}
+
+fn flush_file(job: *Job, text: []const u8, file: Summary) void {
+    jobrun.lock(job.writer_mutex);
+    job.writer.writeAll(text) catch {};
+    job.writer.flush() catch {};
+    jobrun.unlock(job.writer_mutex);
+    jobrun.lock(job.summary_mutex);
+    add_summary(job.summary, file);
+    jobrun.unlock(job.summary_mutex);
 }
 
 pub fn run_json(
@@ -163,6 +311,24 @@ pub fn run_json(
     writer: *std.Io.Writer,
     fork: evm.Fork,
 ) !Summary {
+    const vm = try allocator.create(evm.Vm);
+    defer allocator.destroy(vm);
+    const trie = try allocator.create(trie_mod.Trie);
+    defer allocator.destroy(trie);
+    const receipts = try allocator.create(block_mod.Receipts);
+    defer allocator.destroy(receipts);
+    return run_json_with(allocator, json, writer, fork, vm, trie, receipts);
+}
+
+fn run_json_with(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    writer: *std.Io.Writer,
+    fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
+    receipts: *block_mod.Receipts,
+) !Summary {
     var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(JsonFixture), allocator, json, .{
         .ignore_unknown_fields = true,
     });
@@ -170,7 +336,7 @@ pub fn run_json(
     var summary = Summary{};
     var it = parsed.value.map.iterator();
     while (it.next()) |kv| {
-        try run_named(allocator, kv.key_ptr.*, kv.value_ptr, writer, fork, &summary);
+        try run_named(allocator, kv.key_ptr.*, kv.value_ptr, writer, fork, vm, trie, receipts, &summary);
     }
     return summary;
 }
@@ -182,6 +348,9 @@ fn run_file(
     path: []const u8,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
+    receipts: *block_mod.Receipts,
 ) !Summary {
     const bytes = dir.readFileAlloc(io, path, allocator, .limited(limits.jsontest_bytes_max)) catch |err| {
         if (err == error.StreamTooLong) {
@@ -191,7 +360,7 @@ fn run_file(
         return err;
     };
     defer allocator.free(bytes);
-    return run_json(allocator, bytes, writer, fork) catch |err| {
+    return run_json_with(allocator, bytes, writer, fork, vm, trie, receipts) catch |err| {
         if (!looks_like_chain_test(bytes)) {
             try writer.print("{s} skip not-blockchain-test\n", .{path});
             return .{ .skipped = 1 };
@@ -212,6 +381,9 @@ fn run_named(
     fixture: *const JsonFixture,
     writer: *std.Io.Writer,
     fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
+    receipts: *block_mod.Receipts,
     summary: *Summary,
 ) !void {
     if (fixture.pre.map.count() == 0) return;
@@ -221,7 +393,7 @@ fn run_named(
         summary.skipped += 1;
         return;
     }
-    const outcome = run_case(allocator, fixture, fork) catch |err| {
+    const outcome = run_case(allocator, fixture, fork, vm, trie, receipts) catch |err| {
         try writer.print("{s} fail {s}\n", .{ name, @errorName(err) });
         try writer.flush();
         summary.failed += 1;
@@ -237,9 +409,7 @@ fn skip_reason(name: []const u8, fixture: *const JsonFixture, fork: evm.Fork) ?[
     const mapped = fixture_fork(fixture.network) orelse return "unknown-fork";
     if (mapped != fork) return "fork";
     for (fixture.blocks) |block| {
-        if (has_exception(block.expectException)) return "expect-exception";
         if (block.blockHeader == null) return "undecoded-block";
-        if (block.uncleHeaders.len != 0) return "uncles";
         if (unsupported_header(block.blockHeader.?)) |why| return why;
     }
     if (unsupported_header(fixture.genesisBlockHeader)) |why| return why;
@@ -256,60 +426,152 @@ fn has_exception(value: ?std.json.Value) bool {
     return inner != .null;
 }
 
-fn run_case(allocator: std.mem.Allocator, fixture: *const JsonFixture, fork: evm.Fork) !Outcome {
-    const vm = try allocator.create(evm.Vm);
-    defer allocator.destroy(vm);
+fn run_case(
+    allocator: std.mem.Allocator,
+    fixture: *const JsonFixture,
+    fork: evm.Fork,
+    vm: *evm.Vm,
+    trie: *trie_mod.Trie,
+    receipts: *block_mod.Receipts,
+) !Outcome {
     vm.init_plain(fork);
     try load_pre(&vm.world, &fixture.pre);
     vm.world.journal_count = 0;
     vm.env.chain_id = try parse_u256(fixture.config.chainid);
 
-    var extra: [limits.header_extra_bytes_max]u8 = undefined;
-    const genesis = try decode_header(fixture.genesisBlockHeader, &extra);
-    try check_state_root(allocator, &vm.world, genesis.state_root);
-    const genesis_hash = genesis.hash();
+    var genesis_extra: [limits.header_extra_bytes_max]u8 = undefined;
+    var parent = try decode_header(fixture.genesisBlockHeader, &genesis_extra);
+    try check_state_root(trie, &vm.world, parent.state_root);
+    const genesis_hash = parent.hash();
     try check_header_hash(fixture.genesisBlockHeader.hash, genesis_hash);
     vm.push_block_hash(genesis_hash);
 
+    var parent_extra: [limits.header_extra_bytes_max]u8 = genesis_extra;
+    parent.extra = parent_extra[0..parent.extra.len];
+
     var head = genesis_hash;
     for (fixture.blocks) |block| {
-        head = try apply_fixture_block(allocator, vm, block.blockHeader.?, block.transactions, block.withdrawals);
+        const expect_fail = has_exception(block.expectException);
+        if (block.uncleHeaders.len != 0) {
+            if (expect_fail) continue;
+            return .fail;
+        }
+        const applied = apply_fixture_block(
+            allocator,
+            vm,
+            trie,
+            receipts,
+            parent,
+            block.blockHeader.?,
+            block.transactions,
+            block.withdrawals,
+            fork,
+        ) catch {
+            if (expect_fail) continue;
+            return .fail;
+        };
+        if (expect_fail) return .fail;
+        head = applied.hash;
+        parent = applied.header;
+        @memcpy(parent_extra[0..applied.extra_len], applied.extra[0..applied.extra_len]);
+        parent.extra = parent_extra[0..applied.extra_len];
     }
     try check_header_hash(fixture.lastblockhash, head);
     if (fixture.postState) |state| {
         check_state(&vm.world, &state) catch return .fail;
     }
     if (parse_root(fixture.postStateHash)) |root| {
-        try check_state_root(allocator, &vm.world, root);
+        try check_state_root(trie, &vm.world, root);
     }
     return .pass;
 }
 
+const AppliedBlock = struct {
+    header: header_mod.Header,
+    extra: [limits.header_extra_bytes_max]u8,
+    extra_len: u32,
+    hash: [32]u8,
+};
+
 fn apply_fixture_block(
     allocator: std.mem.Allocator,
     vm: *evm.Vm,
+    trie: *trie_mod.Trie,
+    receipts: *block_mod.Receipts,
+    parent: header_mod.Header,
     json_header: JsonHeader,
     json_txs: []const JsonTx,
     json_withdrawals: ?[]const JsonWithdrawal,
-) ![32]u8 {
+    fork: evm.Fork,
+) !AppliedBlock {
     var extra: [limits.header_extra_bytes_max]u8 = undefined;
-    const header = try decode_header(json_header, &extra);
-    const txs = try parse_txs(allocator, json_txs, header.base_fee);
+    var header = try decode_header(json_header, &extra);
+    if (parse_root(json_header.hash) != null) {
+        if (!block_mod.header_parent_ok(parent, header, fork)) {
+            return error.InvalidHeader;
+        }
+        const parent_hash = parent.hash();
+        if (!std.mem.eql(u8, &header.parent_hash, &parent_hash)) return error.ParentHashMismatch;
+    }
+    const txs = try parse_txs(allocator, json_txs, header.base_fee, vm.env.chain_id);
     defer free_txs(allocator, txs);
     const withdrawals = try parse_withdrawals(allocator, json_withdrawals);
     defer if (withdrawals.len != 0) allocator.free(withdrawals);
-    const gas_used = try vm.apply_block(header, txs, withdrawals);
+    receipts.reset();
+    var requests: [32]u8 = header_mod.empty_requests_hash;
+    const gas_used = try vm.apply_block_commit(header, txs, withdrawals, receipts, &requests);
     if (header.gas_used != 0 and @as(u256, gas_used) != header.gas_used) {
         return error.GasUsedMismatch;
     }
-    try check_state_root(allocator, &vm.world, header.state_root);
+    try check_state_root(trie, &vm.world, header.state_root);
+    try check_commitments(trie, header, json_header, txs, withdrawals, receipts, requests);
     const hash = header.hash();
     try check_header_hash(json_header.hash, hash);
     vm.push_block_hash(hash);
-    return hash;
+    var extra_copy: [limits.header_extra_bytes_max]u8 = extra;
+    header.extra = extra_copy[0..header.extra.len];
+    return .{
+        .header = header,
+        .extra = extra_copy,
+        .extra_len = @intCast(header.extra.len),
+        .hash = hash,
+    };
 }
 
-fn parse_txs(allocator: std.mem.Allocator, json_txs: []const JsonTx, base_fee: u256) ![]evm.BlockTx {
+fn check_commitments(
+    trie: *trie_mod.Trie,
+    header: header_mod.Header,
+    json: JsonHeader,
+    txs: []const evm.BlockTx,
+    withdrawals: []const evm.Withdrawal,
+    receipts: *const block_mod.Receipts,
+    requests: [32]u8,
+) !void {
+    if (has_root_field(json.transactionsTrie, json.transactionsRoot)) {
+        const got = try block_mod.transactions_root(trie, txs);
+        if (!std.mem.eql(u8, &got, &header.transactions_root)) return error.TransactionsRootMismatch;
+    }
+    if (has_root_field(json.receiptTrie, json.receiptsRoot)) {
+        const got = try receipts.receipts_root(@constCast(trie));
+        if (!std.mem.eql(u8, &got, &header.receipts_root)) return error.ReceiptsRootMismatch;
+    }
+    if (has_root_field(json.bloom, json.logsBloom)) {
+        if (!std.mem.eql(u8, &receipts.bloom, &header.bloom)) return error.BloomMismatch;
+    }
+    if (!is_blank_hex(json.withdrawalsRoot)) {
+        const got = try block_mod.withdrawals_root(trie, withdrawals);
+        if (!std.mem.eql(u8, &got, &header.withdrawals_root)) return error.WithdrawalsRootMismatch;
+    }
+    if (!is_blank_hex(json.requestsHash)) {
+        if (!std.mem.eql(u8, &requests, &header.requests_hash)) return error.RequestsHashMismatch;
+    }
+}
+
+fn has_root_field(a: []const u8, b: []const u8) bool {
+    return !is_blank_hex(a) or !is_blank_hex(b);
+}
+
+fn parse_txs(allocator: std.mem.Allocator, json_txs: []const JsonTx, base_fee: u256, chain_id: u256) ![]evm.BlockTx {
     if (json_txs.len == 0) return &.{};
     const txs = try allocator.alloc(evm.BlockTx, json_txs.len);
     errdefer allocator.free(txs);
@@ -319,13 +581,13 @@ fn parse_txs(allocator: std.mem.Allocator, json_txs: []const JsonTx, base_fee: u
         while (i < filled) : (i += 1) free_tx(allocator, txs[i]);
     }
     for (json_txs, 0..) |json_tx, index| {
-        txs[index] = try parse_tx(allocator, json_tx, base_fee);
+        txs[index] = try parse_tx(allocator, json_tx, base_fee, chain_id);
         filled = index + 1;
     }
     return txs;
 }
 
-fn parse_tx(allocator: std.mem.Allocator, json_tx: JsonTx, base_fee: u256) !evm.BlockTx {
+fn parse_tx(allocator: std.mem.Allocator, json_tx: JsonTx, base_fee: u256, chain_id: u256) !evm.BlockTx {
     const data = try parse_hex_alloc(allocator, json_tx.data);
     errdefer allocator.free(data);
     const access = try parse_access(allocator, json_tx.accessList);
@@ -334,18 +596,50 @@ fn parse_tx(allocator: std.mem.Allocator, json_tx: JsonTx, base_fee: u256) !evm.
     errdefer if (auths.len != 0) allocator.free(auths);
     const blobs = try parse_blob_hashes(allocator, json_tx.blobVersionedHashes);
     errdefer if (blobs.len != 0) allocator.free(blobs);
+    const kind = try tx_kind(json_tx);
+    const y_parity = try tx_y_parity(json_tx, kind);
+    const tx_chain = if (is_blank_hex(json_tx.chainId)) chain_id else try parse_u256(json_tx.chainId);
     return .{
+        .kind = kind,
+        .nonce = try parse_u64(json_tx.nonce),
+        .chain_id = tx_chain,
         .to = try call_target(json_tx.to),
         .data = data,
         .gas_limit = try parse_u64(json_tx.gasLimit),
         .value = try parse_u256(json_tx.value),
         .sender = try sender_of(json_tx),
         .gas_price = try tx_gas_price(json_tx, base_fee),
+        .max_fee_per_gas = try parse_u256(json_tx.maxFeePerGas),
+        .max_priority_fee_per_gas = try parse_u256(json_tx.maxPriorityFeePerGas),
         .access_list = access,
         .authorizations = auths,
         .blob_versioned_hashes = blobs,
         .max_fee_per_blob_gas = try parse_u256(json_tx.maxFeePerBlobGas),
+        .y_parity = y_parity,
+        .v = try parse_u256(json_tx.v),
+        .r = try parse_u256(json_tx.r),
+        .s = try parse_u256(json_tx.s),
     };
+}
+
+fn tx_kind(json_tx: JsonTx) !evm.TxKind {
+    const raw = try parse_u64(json_tx.type);
+    return switch (raw) {
+        0 => .legacy,
+        1 => .access_list,
+        2 => .fee_market,
+        3 => .blob,
+        4 => .set_code,
+        else => error.TxType,
+    };
+}
+
+fn tx_y_parity(json_tx: JsonTx, kind: evm.TxKind) !u8 {
+    const text = if (!is_blank_hex(json_tx.yParity)) json_tx.yParity else json_tx.v;
+    if (kind == .legacy and is_blank_hex(json_tx.yParity)) return 0;
+    const value = try parse_u64(text);
+    if (value > 1) return 0;
+    return @intCast(value);
 }
 
 fn parse_withdrawals(allocator: std.mem.Allocator, json_w: ?[]const JsonWithdrawal) ![]evm.Withdrawal {
@@ -356,6 +650,8 @@ fn parse_withdrawals(allocator: std.mem.Allocator, json_w: ?[]const JsonWithdraw
     errdefer allocator.free(out);
     for (items, 0..) |item, index| {
         out[index] = .{
+            .index = try parse_u64(item.index),
+            .validator_index = try parse_u64(item.validatorIndex),
             .address = try parse_address(item.address),
             .amount_gwei = try parse_u256(item.amount),
         };
@@ -419,10 +715,8 @@ fn parse_bloom(json: JsonHeader) ![256]u8 {
     return parse_fixed(text, 256);
 }
 
-fn check_state_root(allocator: std.mem.Allocator, world: *const world_mod.World, want: [32]u8) !void {
+fn check_state_root(trie: *trie_mod.Trie, world: *const world_mod.World, want: [32]u8) !void {
     if (std.mem.allEqual(u8, &want, 0)) return;
-    const trie = try allocator.create(trie_mod.Trie);
-    defer allocator.destroy(trie);
     trie.reset();
     const got = try trie.world_root(world);
     if (!std.mem.eql(u8, &got, &want)) return error.StateRootMismatch;
@@ -434,14 +728,14 @@ fn check_header_hash(text: []const u8, got: [32]u8) !void {
 }
 
 fn fixture_fork(name: []const u8) ?evm.Fork {
+    if (std.ascii.eqlIgnoreCase(name, "merge")) return .paris;
     if (evm.Fork.from_name(name)) |fork| return fork;
-    const pre_prague = [_][]const u8{
+    const pre_paris = [_][]const u8{
         "frontier", "homestead", "byzantium", "constantinople", "petersburg",
-        "istanbul", "berlin",    "london",    "paris",          "merge",
-        "shanghai", "cancun",
+        "istanbul", "berlin",    "london",
     };
-    for (pre_prague) |fork_name| {
-        if (std.ascii.eqlIgnoreCase(name, fork_name)) return .prague;
+    for (pre_paris) |fork_name| {
+        if (std.ascii.eqlIgnoreCase(name, fork_name)) return .paris;
     }
     return null;
 }
@@ -457,7 +751,7 @@ fn load_account(world: *world_mod.World, addr_text: []const u8, account: *const 
     const addr = try parse_address(addr_text);
     try world.set_balance(addr, try parse_u256(account.balance));
     try world.set_nonce(addr, try parse_u64(account.nonce));
-    var code_buf: [limits.code_bytes_max]u8 = undefined;
+    var code_buf: [limits.forge_code_bytes_max]u8 = undefined;
     const n = try parse_hex_into(account.code, &code_buf);
     if (n != 0) try world.set_code(addr, code_buf[0..n]);
     var it = account.storage.map.iterator();
@@ -477,7 +771,7 @@ fn check_account(world: *const world_mod.World, addr_text: []const u8, account: 
     const addr = try parse_address(addr_text);
     if (world.get_nonce(addr) != try parse_u64(account.nonce)) return error.NonceMismatch;
     if (world.get_balance(addr) != try parse_u256(account.balance)) return error.BalanceMismatch;
-    var code_buf: [limits.code_bytes_max]u8 = undefined;
+    var code_buf: [limits.forge_code_bytes_max]u8 = undefined;
     const n = try parse_hex_into(account.code, &code_buf);
     if (!std.mem.eql(u8, world.code_of(addr), code_buf[0..n])) return error.CodeMismatch;
     try check_storage(world, addr, &account.storage);
@@ -714,10 +1008,19 @@ test "osaka-only blockchain fixture skips on prague" {
     try std.testing.expectEqual(@as(u32, 0), summary.passed);
 }
 
-test "expectException blockchain tests are skipped" {
+test "expectException without a decoded header is skipped" {
     const json =
         \\{"bad":{"network":"Osaka","genesisBlockHeader":{"number":"0x00","gasLimit":"0x01","timestamp":"0x01","stateRoot":"0x0000000000000000000000000000000000000000000000000000000000000000"},"pre":{"0x01":{"balance":"0x01","code":"0x","nonce":"0x00","storage":{}}},"blocks":[{"expectException":"BlockException.RLP"}],"config":{"chainid":"0x01"}}}
     ;
     const summary = try with_writer(json, .osaka);
     try std.testing.expectEqual(@as(u32, 1), summary.skipped);
+}
+
+test "expectException decoded block passes when apply fails" {
+    const json =
+        \\{"bad":{"network":"Osaka","genesisBlockHeader":{"parentHash":"0x0000000000000000000000000000000000000000000000000000000000000000","uncleHash":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","coinbase":"0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba","stateRoot":"0x0000000000000000000000000000000000000000000000000000000000000000","gasLimit":"0x2fefd8","gasUsed":"0x00","number":"0x00","timestamp":"0x00","extraData":"0x","mixHash":"0x0000000000000000000000000000000000000000000000000000000000000000","nonce":"0x0000000000000000","baseFeePerGas":"0x0a","withdrawalsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"},"pre":{"0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b":{"balance":"0x01","code":"0x","nonce":"0x00","storage":{}}},"blocks":[{"expectException":"TransactionException.INSUFFICIENT_ACCOUNT_FUNDS","blockHeader":{"parentHash":"0x0000000000000000000000000000000000000000000000000000000000000000","uncleHash":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","coinbase":"0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba","stateRoot":"0x0000000000000000000000000000000000000000000000000000000000000000","gasLimit":"0x2fefd8","gasUsed":"0x00","number":"0x01","timestamp":"0x03e8","extraData":"0x","mixHash":"0x0000000000000000000000000000000000000000000000000000000000000000","nonce":"0x0000000000000000","baseFeePerGas":"0x0a","withdrawalsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"},"transactions":[{"sender":"0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b","to":"0x095e7baea6a6c7c4c2dfeb977efac326af552d87","data":"0x","gasLimit":"0x061a80","gasPrice":"0x0a","value":"0x0186a0","secretKey":"0x45a915e4d060149eb4365960e6a7a45f334393093061116b197e3240065ff2d8"}]}],"config":{"chainid":"0x01"}}}
+    ;
+    const summary = try with_writer(json, .osaka);
+    try std.testing.expectEqual(@as(u32, 1), summary.passed);
+    try std.testing.expectEqual(@as(u32, 0), summary.failed);
 }

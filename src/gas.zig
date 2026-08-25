@@ -1,5 +1,6 @@
 const std = @import("std");
 const limits = @import("limits.zig");
+const fork_mod = @import("fork.zig");
 
 pub const Gas = struct {
     limit: u64,
@@ -27,8 +28,8 @@ pub const Gas = struct {
         try self.consume(memory_expansion_gas(active_bytes, new_bytes));
     }
 
-    pub fn consume_copy(self: *Gas, length: u32) !void {
-        try self.consume(try copy_words_gas(@as(u256, length)));
+    pub fn consume_copy(self: *Gas, length: u256) !void {
+        try self.consume(try copy_words_gas(length));
     }
 
     pub fn refund(self: *Gas, amount: u64) void {
@@ -63,6 +64,8 @@ pub const gas_modexp_min_prague: u64 = 200;
 pub const gas_modexp_min_osaka: u64 = 500;
 /// EIP-4844 `GAS_PER_BLOB` (`2**17`). Blob gas is not execution gas.
 pub const gas_per_blob: u64 = 1 << 17;
+/// EIP-4844 Cancun `BLOB_BASE_FEE_UPDATE_FRACTION`.
+pub const blob_base_fee_update_fraction_cancun: u256 = 3_338_477;
 /// EIP-7691 / Prague+ `BLOB_BASE_FEE_UPDATE_FRACTION`.
 pub const blob_base_fee_update_fraction: u256 = 5_007_716;
 /// EIP-4844 `POINT_EVALUATION`.
@@ -110,11 +113,13 @@ pub fn fees_from_prices(gas_price: u256, base_fee: u256) TxFees {
     return .{ .effective = gas_price, .priority = priority };
 }
 
-pub fn intrinsic_gas(data: []const u8, is_create: bool) u64 {
+pub fn intrinsic_gas(data: []const u8, is_create: bool, fork: fork_mod.Fork) u64 {
     var gas: u64 = gas_tx;
     if (is_create) {
         gas += gas_create_base;
-        gas += gas_init_code_word * @as(u64, (data.len + 31) / 32);
+        if (fork.at_least(.shanghai)) {
+            gas += gas_init_code_word * @as(u64, (data.len + 31) / 32);
+        }
     }
     for (data) |byte| {
         gas += if (byte == 0) gas_tx_data_zero else gas_tx_data_nonzero;
@@ -152,6 +157,14 @@ pub fn copy_words_gas(length: u256) !u64 {
     return product[0];
 }
 
+/// KECCAK256 / CREATE2 extra: `6 * ceil32(length) / 32`.
+pub fn keccak_words_gas(length: u256) !u64 {
+    const copy = try copy_words_gas(length);
+    const product = @mulWithOverflow(copy, 2);
+    if (product[1] == 1) return error.OutOfGas;
+    return product[0];
+}
+
 pub fn access_list_gas(address_count: u64, key_count: u64) u64 {
     return address_count * gas_tx_access_list_address + key_count * gas_tx_access_list_storage_key;
 }
@@ -161,8 +174,22 @@ pub fn blob_gas(count: u32) u64 {
     return @as(u64, count) * gas_per_blob;
 }
 
+/// EIP-4844 max blobs per tx/block. Prague raises this from 6 to 9 (EIP-7691).
+pub fn max_blobs(fork: fork_mod.Fork) u32 {
+    return if (fork.at_least(.prague)) 9 else 6;
+}
+
+/// EIP-4844 target blobs per block. Prague raises this from 3 to 6 (EIP-7691).
+pub fn target_blobs(fork: fork_mod.Fork) u32 {
+    return if (fork.at_least(.prague)) 6 else 3;
+}
+
 pub fn blob_gas_per_block_max() u64 {
     return blob_gas(limits.blob_schedule_max);
+}
+
+pub fn blob_gas_per_block_max_for(fork: fork_mod.Fork) u64 {
+    return blob_gas(max_blobs(fork));
 }
 
 /// EIP-4844 `fake_exponential` / EELS `taylor_exponential`.
@@ -182,9 +209,44 @@ pub fn fake_exponential(factor: u256, numerator: u256, denominator: u256) u256 {
     return output / denominator;
 }
 
-/// `BLOB_MIN_GASPRICE` is 1. Excess 0 yields fee 1.
+pub fn blob_update_fraction(fork: fork_mod.Fork) u256 {
+    return if (fork.at_least(.prague)) blob_base_fee_update_fraction else blob_base_fee_update_fraction_cancun;
+}
+
+/// `BLOB_MIN_GASPRICE` is 1. Excess 0 yields fee 1. Uses the Prague fraction.
 pub fn blob_base_fee(excess_blob_gas: u256) u256 {
     return fake_exponential(1, excess_blob_gas, blob_base_fee_update_fraction);
+}
+
+pub fn blob_base_fee_on(excess_blob_gas: u256, fork: fork_mod.Fork) u256 {
+    return fake_exponential(1, excess_blob_gas, blob_update_fraction(fork));
+}
+
+pub fn blob_gas_per_block_target() u64 {
+    return blob_gas(limits.blob_schedule_target);
+}
+
+/// Parent-header excess for the next block. Osaka applies EIP-7918.
+pub fn next_excess_blob_gas(
+    parent_excess: u256,
+    parent_blob_used: u256,
+    parent_base_fee: u256,
+    fork: fork_mod.Fork,
+) u256 {
+    const max = max_blobs(fork);
+    const target_count = target_blobs(fork);
+    const target: u256 = blob_gas(target_count);
+    const parent_blob_gas = parent_excess + parent_blob_used;
+    if (parent_blob_gas < target) return 0;
+    if (fork.at_least(.osaka)) {
+        const blob_price = @as(u256, gas_per_blob) * blob_base_fee_on(parent_excess, fork);
+        const base_blob_tx_price = limits.blob_base_cost * parent_base_fee;
+        if (base_blob_tx_price > blob_price) {
+            const delta: u256 = max - target_count;
+            return parent_excess + parent_blob_used * delta / max;
+        }
+    }
+    return parent_blob_gas - target;
 }
 
 /// Execution gas after EIP-3529 refund (capped at 1/5 of used) and EIP-7623 floor.
@@ -234,7 +296,13 @@ pub fn max_message_call_gas(gas: u64) u64 {
     return gas - (gas / 64);
 }
 
-/// EELS `calculate_message_call_gas`.
+fn saturating_add(a: u64, b: u64) u64 {
+    const sum = @addWithOverflow(a, b);
+    return if (sum[1] == 1) std.math.maxInt(u64) else sum[0];
+}
+
+/// EELS `calculate_message_call_gas`. Additions saturate: EELS uses unbounded
+/// ints, and a wrapped `u64` cost would under-charge instead of going OOG.
 pub fn calculate_message_call_gas(
     value: u256,
     requested: u64,
@@ -243,11 +311,29 @@ pub fn calculate_message_call_gas(
     extra_gas: u64,
 ) MessageCallGas {
     const stipend: u64 = if (value == 0) 0 else gas_call_stipend;
-    if (gas_left < extra_gas + memory_cost) {
-        return .{ .cost = requested + extra_gas, .sub_call = requested + stipend };
+    const extra_and_memory = @addWithOverflow(extra_gas, memory_cost);
+    if (extra_and_memory[1] == 1 or gas_left < extra_and_memory[0]) {
+        return .{
+            .cost = saturating_add(requested, extra_gas),
+            .sub_call = saturating_add(requested, stipend),
+        };
     }
     const forwarded = @min(requested, max_message_call_gas(gas_left - memory_cost - extra_gas));
-    return .{ .cost = forwarded + extra_gas, .sub_call = forwarded + stipend };
+    return .{
+        .cost = saturating_add(forwarded, extra_gas),
+        .sub_call = saturating_add(forwarded, stipend),
+    };
+}
+
+test "message call gas saturates when requested is max" {
+    const g = calculate_message_call_gas(1, std.math.maxInt(u64), 100, 0, 2600);
+    try std.testing.expectEqual(std.math.maxInt(u64), g.cost);
+    try std.testing.expectEqual(std.math.maxInt(u64), g.sub_call);
+}
+
+test "message call gas extra plus memory overflow is out of gas" {
+    const g = calculate_message_call_gas(0, 10, 100, std.math.maxInt(u64), 5);
+    try std.testing.expectEqual(@as(u64, 15), g.cost);
 }
 
 test "gas consume" {
@@ -257,11 +343,12 @@ test "gas consume" {
 }
 
 test "intrinsic gas empty call" {
-    try std.testing.expectEqual(@as(u64, 21_000), intrinsic_gas(&[_]u8{}, false));
+    try std.testing.expectEqual(@as(u64, 21_000), intrinsic_gas(&[_]u8{}, false, .osaka));
 }
 
 test "intrinsic gas create adds 32000" {
-    try std.testing.expectEqual(@as(u64, 53_000), intrinsic_gas(&[_]u8{}, true));
+    try std.testing.expectEqual(@as(u64, 53_000), intrinsic_gas(&[_]u8{}, true, .osaka));
+    try std.testing.expectEqual(@as(u64, 53_000), intrinsic_gas(&[_]u8{}, true, .paris));
 }
 
 test "calldata floor empty is 21000" {
@@ -294,6 +381,7 @@ test "memory expansion gas is cost difference" {
 test "copy words gas zero is zero" {
     try std.testing.expectEqual(@as(u64, 0), try copy_words_gas(0));
     try std.testing.expectEqual(@as(u64, 3), try copy_words_gas(1));
+    try std.testing.expectEqual(@as(u64, 6), try keccak_words_gas(1));
 }
 
 test "blob gas is 2^17 per blob" {
@@ -307,4 +395,32 @@ test "blob base fee is 1 at excess 0" {
 
 test "blob base fee is 2 when excess equals the update fraction" {
     try std.testing.expectEqual(@as(u256, 2), blob_base_fee(blob_base_fee_update_fraction));
+}
+
+test "next excess blob gas is zero when parent is below target" {
+    try std.testing.expectEqual(@as(u256, 0), next_excess_blob_gas(0, 0, 1, .osaka));
+    try std.testing.expectEqual(@as(u256, 0), next_excess_blob_gas(0, blob_gas(5), 1, .osaka));
+}
+
+test "next excess blob gas subtracts the target when above it" {
+    const used: u256 = blob_gas(7);
+    const target: u256 = blob_gas_per_block_target();
+    try std.testing.expectEqual(used - target, next_excess_blob_gas(0, used, 1, .osaka));
+}
+
+test "next excess blob gas osaka reserve keeps a fraction of used" {
+    const used: u256 = blob_gas(7);
+    const high_fee: u256 = 1_000_000_000;
+    const delta: u256 = limits.blob_schedule_max - limits.blob_schedule_target;
+    const want = used * delta / limits.blob_schedule_max;
+    try std.testing.expectEqual(want, next_excess_blob_gas(0, used, high_fee, .osaka));
+    try std.testing.expectEqual(used - blob_gas_per_block_target(), next_excess_blob_gas(0, used, high_fee, .prague));
+}
+
+test "cancun blob schedule is six max three target" {
+    try std.testing.expectEqual(@as(u32, 6), max_blobs(.cancun));
+    try std.testing.expectEqual(@as(u32, 3), target_blobs(.cancun));
+    try std.testing.expectEqual(@as(u32, 9), max_blobs(.prague));
+    try std.testing.expectEqual(blob_base_fee_update_fraction_cancun, blob_update_fraction(.cancun));
+    try std.testing.expectEqual(blob_base_fee_update_fraction, blob_update_fraction(.osaka));
 }

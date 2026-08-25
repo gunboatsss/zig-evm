@@ -13,6 +13,7 @@ test {
     _ = @import("rlp.zig");
     _ = @import("header.zig");
     _ = @import("trie.zig");
+    _ = @import("block.zig");
     _ = @import("delegation.zig");
     _ = @import("precompile.zig");
     _ = @import("modexp.zig");
@@ -30,5 +31,6 @@ test {
     _ = @import("forge_test.zig");
     _ = @import("jsontest.zig");
     _ = @import("chaintest.zig");
+    _ = @import("jobrun.zig");
     std.testing.refAllDecls(@This());
 }

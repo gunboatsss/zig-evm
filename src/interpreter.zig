@@ -4,6 +4,7 @@ const limits = @import("limits.zig");
 const memory_mod = @import("memory.zig");
 const opcode_mod = @import("opcode.zig");
 const precompile = @import("precompile.zig");
+const block_mod = @import("block.zig");
 const cheatcode = @import("cheatcode.zig");
 const rlp = @import("rlp.zig");
 const header_mod = @import("header.zig");
@@ -52,6 +53,8 @@ pub const Frame = struct {
     log_data_mark: u32,
     created_mark: u32,
     delete_mark: u32,
+    accessed_mark: u32,
+    accessed_slot_mark: u32,
     mem_offset: u32,
 };
 
@@ -69,30 +72,11 @@ const AccessedSlot = struct {
     original: u256,
 };
 
-pub const AccessListItem = struct {
-    address: u256,
-    keys: []const u256,
-};
-
+pub const AccessListItem = block_mod.AccessListItem;
 pub const Authorization = delegation.Authorization;
-
-pub const BlockTx = struct {
-    to: ?u256,
-    data: []const u8,
-    gas_limit: u64,
-    value: u256,
-    sender: u256,
-    gas_price: u256,
-    access_list: []const AccessListItem = &.{},
-    authorizations: []const Authorization = &.{},
-    blob_versioned_hashes: []const [32]u8 = &.{},
-    max_fee_per_blob_gas: u256 = 0,
-};
-
-pub const Withdrawal = struct {
-    address: u256,
-    amount_gwei: u256,
-};
+pub const BlockTx = block_mod.BlockTx;
+pub const Withdrawal = block_mod.Withdrawal;
+pub const TxKind = block_mod.TxKind;
 
 /// EIP-4788 / EIP-2935 / EIP-7002 / EIP-7251 system caller.
 const system_address: u256 = 0xfffffffffffffffffffffffffffffffffffffffe;
@@ -129,6 +113,7 @@ pub const Vm = struct {
     access_list: []const AccessListItem,
     authorizations: []const delegation.Authorization,
     blob_versioned_hashes: []const [32]u8,
+    max_fee_per_gas: u256,
     max_fee_per_blob_gas: u256,
     created_this_tx: [limits.accounts_max]u256,
     created_count: u32,
@@ -151,7 +136,7 @@ pub const Vm = struct {
     ) !void {
         std.debug.assert(gas_limit > 0);
         std.debug.assert(code.len <= limits.code_bytes_max);
-        std.debug.assert(calldata.len <= limits.calldata_bytes_max);
+        if (calldata.len > limits.calldata_bytes_max) return error.CalldataLimit;
         self.world.init();
         self.frame_count = 0;
         self.memory_used = 0;
@@ -170,6 +155,7 @@ pub const Vm = struct {
         self.access_list = &.{};
         self.authorizations = &.{};
         self.blob_versioned_hashes = &.{};
+        self.max_fee_per_gas = 0;
         self.max_fee_per_blob_gas = 0;
         self.tx_blob_gas_used = 0;
         self.created_count = 0;
@@ -224,6 +210,7 @@ pub const Vm = struct {
         self.access_list = &.{};
         self.authorizations = &.{};
         self.blob_versioned_hashes = &.{};
+        self.max_fee_per_gas = 0;
         self.max_fee_per_blob_gas = 0;
         self.trace = null;
         self.block_hash_count = 0;
@@ -244,7 +231,7 @@ pub const Vm = struct {
         const sender = context.caller;
         try self.mark_warm(sender);
         try self.mark_warm(context.origin);
-        try self.mark_warm(self.env.coinbase);
+        try self.maybe_warm_coinbase();
         const nonce = self.world.get_nonce(sender);
         const address = rlp.create_address(sender, nonce);
         try self.world.increment_nonce(sender);
@@ -292,14 +279,14 @@ pub const Vm = struct {
         value: u256,
         context: state_mod.ExecutionContext,
     ) !Status {
-        std.debug.assert(calldata.len <= limits.calldata_bytes_max);
+        if (calldata.len > limits.calldata_bytes_max) return error.CalldataLimit;
         self.reset_tx();
         try self.warm_precompiles();
         try self.warm_access_list();
         try self.mark_warm(to);
         try self.mark_warm(context.caller);
         try self.mark_warm(context.origin);
-        try self.mark_warm(self.env.coinbase);
+        try self.maybe_warm_coinbase();
         try self.apply_authorizations();
         const resolved = try self.follow_tx_delegation(to);
         var child_context = context;
@@ -335,17 +322,22 @@ pub const Vm = struct {
         sender: u256,
     ) !Status {
         if (self.fork.at_least(.osaka) and gas_limit > limits.tx_gas_cap) return error.GasLimitTooHigh;
+        if (self.authorizations.len != 0 and !self.fork.at_least(.prague)) return error.InvalidTx;
         if (self.authorizations.len != 0 and to == null) return error.InvalidTx;
         const blob_gas = try self.blob_tx_gas(to);
-        const intrinsic = gas_mod.intrinsic_gas(data, to == null) + self.access_list_gas() +
+        const intrinsic = gas_mod.intrinsic_gas(data, to == null, self.fork) + self.access_list_gas() +
             @as(u64, self.authorizations.len) * gas_mod.gas_auth_per_empty;
         if (gas_limit < intrinsic) return error.IntrinsicGas;
         const fees = gas_mod.fees_from_prices(self.env.gas_price, self.env.base_fee);
-        const upfront = @as(u256, gas_limit) * fees.effective +
-            @as(u256, blob_gas) * self.max_fee_per_blob_gas;
+        // Cap check uses fee caps; the debit is effective gas + blob * blob_base_fee.
+        const fee_cap = @max(self.max_fee_per_gas, fees.effective);
         const sender_bal = self.world.get_balance(sender);
-        if (sender_bal < upfront + value) return error.InsufficientFunds;
-        try self.world.set_balance(sender, sender_bal - upfront);
+        const cap_cost = @as(u256, gas_limit) * fee_cap +
+            @as(u256, blob_gas) * self.max_fee_per_blob_gas + value;
+        if (sender_bal < cap_cost) return error.InsufficientFunds;
+        const debit = @as(u256, gas_limit) * fees.effective +
+            @as(u256, blob_gas) * self.env.blob_base_fee;
+        try self.world.set_balance(sender, sender_bal - debit);
         self.env.gas_price = fees.effective;
         var ctx = self.env;
         ctx.caller = sender;
@@ -361,8 +353,11 @@ pub const Vm = struct {
             const created = try self.apply_create(data, exec_gas, value, ctx);
             if (created != 0) try self.destroy_deleted();
         }
-        try self.settle_gas(sender, gas_limit, fees, gas_mod.calldata_floor_gas(data), blob_gas);
-        return self.current().status;
+        const floor: u64 = if (self.fork.at_least(.prague)) gas_mod.calldata_floor_gas(data) else 0;
+        // CREATE collision / oversized initcode never push a frame; leftover exec gas is 0.
+        const remaining: u64 = if (self.frame_count >= 1) self.current().gas.remaining() else 0;
+        try self.settle_gas(sender, gas_limit, fees, floor, blob_gas, remaining);
+        return if (self.frame_count >= 1) self.current().status else .faulted;
     }
 
     /// Run every transaction in a block, then credit EIP-4895 withdrawals.
@@ -374,23 +369,42 @@ pub const Vm = struct {
         txs: []const BlockTx,
         withdrawals: []const Withdrawal,
     ) !u64 {
+        return self.apply_block_commit(header, txs, withdrawals, null, null);
+    }
+
+    pub fn apply_block_commit(
+        self: *Vm,
+        header: header_mod.Header,
+        txs: []const BlockTx,
+        withdrawals: []const Withdrawal,
+        receipts: ?*block_mod.Receipts,
+        requests_out: ?*[32]u8,
+    ) !u64 {
+        std.debug.assert(txs.len <= limits.block_txs_max);
         self.bind_block(header);
         try self.apply_block_system_pre(header);
         var gas_used: u64 = 0;
         var blob_gas_used: u64 = 0;
         for (txs) |tx| {
-            try self.apply_block_tx(tx);
+            const status = try self.apply_block_tx(tx);
             const next = @addWithOverflow(gas_used, self.tx_gas_used);
             if (next[1] == 1) return error.BlockGasOverflow;
             gas_used = next[0];
             const blob_next = @addWithOverflow(blob_gas_used, self.tx_blob_gas_used);
             if (blob_next[1] == 1) return error.BlobGasLimit;
             blob_gas_used = blob_next[0];
-            if (blob_gas_used > gas_mod.blob_gas_per_block_max()) return error.BlobGasLimit;
+            if (blob_gas_used > gas_mod.blob_gas_per_block_max_for(self.fork)) return error.BlobGasLimit;
+            if (receipts) |sink| {
+                var views: [limits.logs_max]block_mod.LogView = undefined;
+                const logs = self.tx_log_views(&views);
+                const ok = status == .returned or status == .stopped;
+                try sink.push(tx.kind, ok, gas_used, logs);
+            }
         }
         if (@as(u256, blob_gas_used) != header.blob_gas_used) return error.BlobGasUsedMismatch;
         try self.apply_withdrawals(withdrawals);
-        try self.apply_block_system_post();
+        const deposits: []const u8 = if (receipts) |sink| sink.deposits[0..sink.deposit_len] else &.{};
+        try self.apply_block_system_post(requests_out, deposits);
         return gas_used;
     }
 
@@ -414,18 +428,32 @@ pub const Vm = struct {
         self.env.gas_limit = header.gas_limit;
         self.env.base_fee = header.base_fee;
         self.env.prev_randao = word.from_bytes_be(&header.prev_randao);
-        self.env.blob_base_fee = gas_mod.blob_base_fee(header.excess_blob_gas);
+        self.env.blob_base_fee = gas_mod.blob_base_fee_on(header.excess_blob_gas, self.fork);
     }
 
-    fn apply_block_tx(self: *Vm, tx: BlockTx) !void {
+    fn apply_block_tx(self: *Vm, tx: BlockTx) !Status {
         if (tx.gas_limit == 0) return error.IntrinsicGas;
         self.access_list = tx.access_list;
         self.authorizations = tx.authorizations;
         self.blob_versioned_hashes = tx.blob_versioned_hashes;
         std.debug.assert(self.blob_versioned_hashes.len <= limits.blob_versioned_hashes_max);
+        self.max_fee_per_gas = if (tx.max_fee_per_gas != 0) tx.max_fee_per_gas else tx.gas_price;
         self.max_fee_per_blob_gas = tx.max_fee_per_blob_gas;
         self.env.gas_price = tx.gas_price;
-        _ = try self.apply_tx(tx.to, tx.data, tx.gas_limit, tx.value, tx.sender);
+        return self.apply_tx(tx.to, tx.data, tx.gas_limit, tx.value, tx.sender);
+    }
+
+    fn tx_log_views(self: *const Vm, views: *[limits.logs_max]block_mod.LogView) []block_mod.LogView {
+        var i: u32 = 0;
+        while (i < self.log_count) : (i += 1) {
+            const log = self.logs[i];
+            views[i] = .{
+                .address = log.address,
+                .topics = log.topics[0..log.topic_count],
+                .data = self.log_data[log.data_off .. log.data_off + log.data_len],
+            };
+        }
+        return views[0..self.log_count];
     }
 
     fn apply_withdrawals(self: *Vm, withdrawals: []const Withdrawal) !void {
@@ -443,13 +471,22 @@ pub const Vm = struct {
         try self.system_call(history_storage_address, &header.parent_hash);
     }
 
-    fn apply_block_system_post(self: *Vm) !void {
-        try self.system_call(withdrawal_request_address, &[_]u8{});
-        try self.system_call(consolidation_request_address, &[_]u8{});
+    fn apply_block_system_post(self: *Vm, requests_out: ?*[32]u8, deposits: []const u8) !void {
+        var wd: [limits.system_request_bytes_max]u8 = undefined;
+        var cons: [limits.system_request_bytes_max]u8 = undefined;
+        const wd_n = try self.system_call_out(withdrawal_request_address, &[_]u8{}, &wd, true);
+        const cons_n = try self.system_call_out(consolidation_request_address, &[_]u8{}, &cons, true);
+        if (requests_out) |out| {
+            out.* = block_mod.requests_hash(deposits, wd[0..wd_n], cons[0..cons_n]);
+        }
     }
 
     fn system_call(self: *Vm, to: u256, data: []const u8) !void {
-        if (self.world.code_of(to).len == 0) return;
+        _ = try self.system_call_out(to, data, &.{}, false);
+    }
+
+    fn system_call_out(self: *Vm, to: u256, data: []const u8, dest: []u8, checked: bool) !u32 {
+        if (self.world.code_of(to).len == 0) return 0;
         const saved_list = self.access_list;
         const saved_auth = self.authorizations;
         const saved_blobs = self.blob_versioned_hashes;
@@ -465,14 +502,23 @@ pub const Vm = struct {
         ctx.caller = system_address;
         ctx.origin = system_address;
         ctx.call_value = 0;
-        _ = self.apply_message(to, data, system_tx_gas, 0, ctx) catch {};
+        const status = self.apply_message(to, data, system_tx_gas, 0, ctx) catch |err| {
+            if (checked) return err;
+            return 0;
+        };
+        const ok = status == .returned or status == .stopped;
+        if (checked and !ok) return error.SystemCallFailed;
+        const n = @min(self.output_len, dest.len);
+        if (n != 0) @memcpy(dest[0..n], self.output_buffer[0..n]);
+        return n;
     }
 
     fn blob_tx_gas(self: *const Vm, to: ?u256) !u64 {
         const hashes = self.blob_versioned_hashes;
         if (hashes.len == 0) return 0;
+        if (!self.fork.at_least(.cancun)) return error.InvalidTx;
         if (to == null) return error.InvalidTx;
-        if (hashes.len > limits.blob_schedule_max) return error.BlobLimit;
+        if (hashes.len > gas_mod.max_blobs(self.fork)) return error.BlobLimit;
         for (hashes) |hash| {
             if (hash[0] != limits.kzg_versioned_hash_version) return error.InvalidBlobHash;
         }
@@ -480,22 +526,25 @@ pub const Vm = struct {
         return gas_mod.blob_gas(@intCast(hashes.len));
     }
 
-    fn settle_gas(self: *Vm, sender: u256, gas_limit: u64, fees: gas_mod.TxFees, floor: u64, blob_gas: u64) !void {
-        std.debug.assert(self.frame_count >= 1);
+    fn settle_gas(
+        self: *Vm,
+        sender: u256,
+        gas_limit: u64,
+        fees: gas_mod.TxFees,
+        floor: u64,
+        blob_gas: u64,
+        remaining: u64,
+    ) !void {
         const used = gas_mod.settled_gas_used(
             gas_limit,
-            self.current().gas.remaining(),
+            remaining,
             self.gas_refund,
             floor,
         );
         self.tx_gas_used = used;
         self.tx_blob_gas_used = blob_gas;
         const unused = gas_limit - used;
-        var refund = @as(u256, unused) * fees.effective;
-        if (blob_gas != 0) {
-            std.debug.assert(self.max_fee_per_blob_gas >= self.env.blob_base_fee);
-            refund += @as(u256, blob_gas) * (self.max_fee_per_blob_gas - self.env.blob_base_fee);
-        }
+        const refund = @as(u256, unused) * fees.effective;
         try self.world.set_balance(sender, self.world.get_balance(sender) + refund);
         const tip = @as(u256, used) * fees.priority;
         if (tip == 0) return;
@@ -584,6 +633,9 @@ pub const Vm = struct {
         self.log_data_used = frame.log_data_mark;
         self.created_count = frame.created_mark;
         self.delete_count = frame.delete_mark;
+        // EIP-2929 access lists are journaled; a reverted call un-warms.
+        self.accessed_count = frame.accessed_mark;
+        self.accessed_slot_count = frame.accessed_slot_mark;
     }
 
     pub fn current(self: *Vm) *Frame {
@@ -615,8 +667,8 @@ pub const Vm = struct {
             return;
         }
         try frame.gas.consume(opcode_mod.Opcode.static_gas(opcode));
-        const next_pc = try self.execute(opcode);
-        std.debug.assert(next_pc <= frame.code.len);
+        var next_pc = try self.execute(opcode);
+        if (next_pc > frame.code.len) next_pc = @intCast(frame.code.len);
         frame.pc = next_pc;
     }
 
@@ -804,7 +856,7 @@ pub const Vm = struct {
         try frame.gas.consume(cost);
         if (frame.is_static) return error.WriteInStaticContext;
         try self.world.move_ether(originator, beneficiary, balance);
-        if (self.is_created(originator)) {
+        if (self.is_created(originator) or !self.fork.at_least(.cancun)) {
             if (beneficiary == originator) try self.world.set_balance(originator, 0);
             try self.mark_deleted(originator);
         }
@@ -846,21 +898,13 @@ pub const Vm = struct {
     fn exec_extcodecopy(self: *Vm) !u32 {
         const frame = self.current();
         const address = word.to_address(try frame.stack.pop());
-        const dest = try word.to_u32(try frame.stack.pop());
-        const offset = try word.to_u32(try frame.stack.pop());
-        const size = try word.to_u32(try frame.stack.pop());
+        const dest = try frame.stack.pop();
+        const offset = try frame.stack.pop();
+        const size = try frame.stack.pop();
         try frame.gas.consume(try self.access_account(address));
         try frame.gas.consume_copy(size);
-        const old_size = frame.memory.size();
-        try frame.memory.expand(dest, size);
-        try frame.gas.consume_memory(old_size, frame.memory.size());
-        const code = self.world.code_of(address);
-        var index: u32 = 0;
-        while (index < size) : (index += 1) {
-            const src = offset + index;
-            const byte: u8 = if (src < code.len) code[src] else 0;
-            try frame.memory.store_byte(dest + index, byte);
-        }
+        try expand_memory(frame, dest, size);
+        try frame.memory.write_from(dest, offset, size, self.world.code_of(address));
         return frame.pc + 1;
     }
 
@@ -872,15 +916,15 @@ pub const Vm = struct {
             .delegatecall, .staticcall => 0,
             .call, .callcode => try frame.stack.pop(),
         };
-        const in_offset = try word.to_u32(try frame.stack.pop());
-        const in_size = try word.to_u32(try frame.stack.pop());
-        const out_offset = try word.to_u32(try frame.stack.pop());
-        const out_size = try word.to_u32(try frame.stack.pop());
-        const old_size = frame.memory.size();
-        try frame.memory.expand(in_offset, in_size);
-        try frame.memory.expand(out_offset, out_size);
-        const memory_cost = memory_gas_delta(old_size, frame.memory.size());
-        try frame.gas.consume(memory_cost);
+        const in_offset = try frame.stack.pop();
+        const in_size = try frame.stack.pop();
+        const out_offset = try frame.stack.pop();
+        const out_size = try frame.stack.pop();
+        try expand_memory_union(frame, in_offset, in_size, out_offset, out_size);
+        const in_off: u32 = if (in_size == 0) 0 else @intCast(in_offset);
+        const in_len: u32 = if (in_size == 0) 0 else @intCast(in_size);
+        const out_off: u32 = if (out_size == 0) 0 else @intCast(out_offset);
+        const out_len: u32 = if (out_size == 0) 0 else @intCast(out_size);
 
         const target = switch (kind) {
             .call, .staticcall => to,
@@ -907,7 +951,9 @@ pub const Vm = struct {
             extra,
         );
         try frame.gas.consume(call_gas.cost);
-        if (frame.is_static and should_transfer and transfer_value != 0) return error.WriteInStaticContext;
+        // EIP-214: CALL with value is a write. CALLCODE is not, even with value
+        // (sender and recipient are the same account).
+        if (frame.is_static and kind == .call and transfer_value != 0) return error.WriteInStaticContext;
         self.last_return_len = 0;
         if (frame.depth + 1 > limits.call_depth_limit) {
             frame.gas.refund(call_gas.sub_call);
@@ -942,17 +988,17 @@ pub const Vm = struct {
             if (try self.try_mock(
                 to,
                 transfer_value,
-                in_offset,
-                in_size,
-                out_offset,
-                out_size,
+                in_off,
+                in_len,
+                out_off,
+                out_len,
                 call_gas.sub_call,
             )) return frame.pc + 1;
         }
         self.bump_pool(frame);
         try self.push_message(.{
             .code = resolved.code,
-            .calldata = frame.memory.bytes[in_offset .. in_offset + in_size],
+            .calldata = frame.memory.span(in_offset, in_size),
             .gas_limit = call_gas.sub_call,
             .context = child_context,
             .depth = frame.depth + 1,
@@ -960,8 +1006,8 @@ pub const Vm = struct {
             .kind = .call,
             .code_address = resolved.address,
             .disable_precompiles = resolved.disable_precompiles,
-            .out_offset = out_offset,
-            .out_size = out_size,
+            .out_offset = out_off,
+            .out_size = out_len,
             .should_transfer = should_transfer,
             .value = transfer_value,
         });
@@ -972,17 +1018,16 @@ pub const Vm = struct {
         const frame = self.current();
         if (frame.is_static) return error.WriteInStaticContext;
         const endowment = try frame.stack.pop();
-        const in_offset = try word.to_u32(try frame.stack.pop());
-        const in_size = try word.to_u32(try frame.stack.pop());
+        const in_offset = try frame.stack.pop();
+        const in_size = try frame.stack.pop();
         const salt: u256 = if (is_create2) try frame.stack.pop() else 0;
-        if (in_size > limits.init_code_bytes_max) return error.OutOfGas;
-        const old_size = frame.memory.size();
-        try frame.memory.expand(in_offset, in_size);
+        if (self.fork.at_least(.shanghai) and in_size > limits.init_code_bytes_max) return error.OutOfGas;
+        try expand_memory(frame, in_offset, in_size);
+        const in_len: u32 = if (in_size == 0) 0 else @intCast(in_size);
         var cost: u64 = gas_mod.gas_create_base;
-        cost += init_code_gas(in_size);
-        if (is_create2) cost += @as(u64, (in_size + 31) / 32) * 6;
+        if (self.fork.at_least(.shanghai)) cost += init_code_gas(in_len);
+        if (is_create2) cost += try gas_mod.keccak_words_gas(in_size);
         try frame.gas.consume(cost);
-        try frame.gas.consume_memory(old_size, frame.memory.size());
         self.last_return_len = 0;
         const create_gas = gas_mod.max_message_call_gas(frame.gas.remaining());
         try frame.gas.consume(create_gas);
@@ -993,7 +1038,7 @@ pub const Vm = struct {
             try frame.stack.push(0);
             return frame.pc + 1;
         }
-        const init_code = frame.memory.bytes[in_offset .. in_offset + in_size];
+        const init_code = frame.memory.span(in_offset, in_size);
         const contract = if (is_create2)
             rlp.create2_address(sender, salt, init_code)
         else
@@ -1030,29 +1075,25 @@ pub const Vm = struct {
 
     fn halt_with_output(self: *Vm, status: Status) !u32 {
         const frame = self.current();
-        const offset = try word.to_u32(try frame.stack.pop());
-        const size = try word.to_u32(try frame.stack.pop());
+        const offset = try frame.stack.pop();
+        const size = try frame.stack.pop();
+        try expand_memory(frame, offset, size);
         if (size > limits.returndata_bytes_max) return error.ReturnDataTooLarge;
-        const old_size = frame.memory.size();
-        try frame.memory.expand(offset, size);
-        try frame.gas.consume_memory(old_size, frame.memory.size());
-        @memcpy(self.output_buffer[0..size], frame.memory.bytes[offset .. offset + size]);
-        self.output_len = size;
+        const out = frame.memory.span(offset, size);
+        @memcpy(self.output_buffer[0..out.len], out);
+        self.output_len = @intCast(out.len);
         frame.status = status;
         return @intCast(frame.code.len);
     }
 
     fn exec_keccak256(self: *Vm) !u32 {
         const frame = self.current();
-        const offset = try word.to_u32(try frame.stack.pop());
-        const size = try word.to_u32(try frame.stack.pop());
-        const old_size = frame.memory.size();
-        try frame.memory.expand(offset, size);
-        try frame.gas.consume_memory(old_size, frame.memory.size());
-        const words_count = (size + 31) / 32;
-        try frame.gas.consume(@as(u64, words_count) * 6);
+        const offset = try frame.stack.pop();
+        const size = try frame.stack.pop();
+        try frame.gas.consume(try gas_mod.keccak_words_gas(size));
+        try expand_memory(frame, offset, size);
         var hash: [32]u8 = undefined;
-        std.crypto.hash.sha3.Keccak256.hash(frame.memory.bytes[offset .. offset + size], &hash, .{});
+        std.crypto.hash.sha3.Keccak256.hash(frame.memory.span(offset, size), &hash, .{});
         try frame.stack.push(word.from_bytes_be(&hash));
         return frame.pc + 1;
     }
@@ -1061,32 +1102,31 @@ pub const Vm = struct {
         std.debug.assert(topic_count <= limits.log_topics_max);
         const frame = self.current();
         if (frame.is_static) return error.WriteInStaticContext;
-        const offset = try word.to_u32(try frame.stack.pop());
-        const size = try word.to_u32(try frame.stack.pop());
+        const offset = try frame.stack.pop();
+        const size = try frame.stack.pop();
         if (size > limits.log_data_bytes_max) return error.LogDataTooLarge;
         var topics: [limits.log_topics_max]u256 = undefined;
         var index: u32 = 0;
         while (index < topic_count) : (index += 1) {
             topics[index] = try frame.stack.pop();
         }
-        const log_gas = 375 + 375 * @as(u64, topic_count) + @as(u64, size) * gas_mod.gas_log_data;
+        const size_u: u32 = @intCast(size);
+        const log_gas = 375 + 375 * @as(u64, topic_count) + @as(u64, size_u) * gas_mod.gas_log_data;
         try frame.gas.consume(log_gas);
-        const old_size = frame.memory.size();
-        try frame.memory.expand(offset, size);
-        try frame.gas.consume_memory(old_size, frame.memory.size());
+        try expand_memory(frame, offset, size);
         if (self.log_count >= limits.logs_max) return error.LogLimit;
-        if (self.log_data_used + size > limits.log_data_pool_bytes_max) return error.LogDataTooLarge;
+        if (self.log_data_used + size_u > limits.log_data_pool_bytes_max) return error.LogDataTooLarge;
         const data_off = self.log_data_used;
-        if (size > 0) {
-            @memcpy(self.log_data[data_off .. data_off + size], frame.memory.bytes[offset .. offset + size]);
+        if (size_u > 0) {
+            @memcpy(self.log_data[data_off .. data_off + size_u], frame.memory.span(offset, size));
         }
-        self.log_data_used += size;
+        self.log_data_used += size_u;
         self.logs[self.log_count] = .{
             .address = frame.context.address,
             .topics = topics,
             .topic_count = topic_count,
             .data_off = data_off,
-            .data_len = size,
+            .data_len = size_u,
         };
         self.log_count += 1;
         return frame.pc + 1;
@@ -1251,15 +1291,18 @@ pub const Vm = struct {
 
     fn exec_returndatacopy(self: *Vm) !u32 {
         const frame = self.current();
-        const dest = try word.to_u32(try frame.stack.pop());
-        const offset = try word.to_u32(try frame.stack.pop());
-        const size = try word.to_u32(try frame.stack.pop());
-        if (offset + size > self.last_return_len) return error.ReturnDataOutOfBounds;
+        const dest = try frame.stack.pop();
+        const offset = try frame.stack.pop();
+        const size = try frame.stack.pop();
+        const src_end = @addWithOverflow(offset, size);
+        if (src_end[1] == 1 or src_end[0] > self.last_return_len) return error.ReturnDataOutOfBounds;
         try frame.gas.consume_copy(size);
-        const old_size = frame.memory.size();
-        try frame.memory.expand(dest, size);
-        try frame.gas.consume_memory(old_size, frame.memory.size());
-        @memcpy(frame.memory.bytes[dest .. dest + size], self.last_return[offset .. offset + size]);
+        try expand_memory(frame, dest, size);
+        if (size == 0) return frame.pc + 1;
+        const dest_off: u32 = @intCast(dest);
+        const src_off: u32 = @intCast(offset);
+        const len: u32 = @intCast(size);
+        @memcpy(frame.memory.bytes[dest_off .. dest_off + len], self.last_return[src_off .. src_off + len]);
         return frame.pc + 1;
     }
 
@@ -1272,6 +1315,8 @@ pub const Vm = struct {
         const journal_mark = self.world.mark();
         const created_mark = self.created_count;
         const delete_mark = self.delete_count;
+        const accessed_mark = self.accessed_count;
+        const accessed_slot_mark = self.accessed_slot_count;
         if (params.should_transfer and params.value != 0) {
             try self.world.touch(params.context.address);
             try self.world.move_ether(params.context.caller, params.context.address, params.value);
@@ -1305,6 +1350,8 @@ pub const Vm = struct {
             .log_data_mark = self.log_data_used,
             .created_mark = created_mark,
             .delete_mark = delete_mark,
+            .accessed_mark = accessed_mark,
+            .accessed_slot_mark = accessed_slot_mark,
             .mem_offset = mem_offset,
         };
         self.frame_count += 1;
@@ -1414,7 +1461,9 @@ pub const Vm = struct {
     }
 
     fn init_code_limit(self: *const Vm) u32 {
-        return if (self.cheats_enabled) limits.forge_init_code_bytes_max else limits.init_code_bytes_max;
+        if (self.cheats_enabled) return limits.forge_init_code_bytes_max;
+        if (self.fork.at_least(.shanghai)) return limits.init_code_bytes_max;
+        return limits.code_pool_bytes_max;
     }
 
     fn bump_pool(self: *Vm, frame: *Frame) void {
@@ -1443,12 +1492,21 @@ pub const Vm = struct {
     }
 
     fn copy_to_pool(self: *Vm, data: []const u8) ![]const u8 {
+        if (data.len == 0) return data;
+        if (slice_in_buffer(data, &self.memory_pool)) return data;
         const len: u32 = @intCast(data.len);
         if (self.memory_used + len > limits.memory_pool_bytes_max) return error.MemoryOverflow;
         const start = self.memory_used;
-        if (len > 0) @memcpy(self.memory_pool[start .. start + len], data);
+        @memcpy(self.memory_pool[start .. start + len], data);
         self.memory_used += len;
         return self.memory_pool[start .. start + len];
+    }
+
+    fn slice_in_buffer(data: []const u8, buffer: []const u8) bool {
+        const start = @intFromPtr(data.ptr);
+        const buf_start = @intFromPtr(buffer.ptr);
+        const offset = start -% buf_start;
+        return offset <= buffer.len and data.len <= buffer.len - offset;
     }
 
     fn memory_at(self: *Vm, offset: u32) memory_mod.Memory {
@@ -1516,10 +1574,15 @@ pub const Vm = struct {
 
     fn warm_precompiles(self: *Vm) !void {
         var address: u256 = 1;
-        while (address <= 17) : (address += 1) {
+        const last = precompile.last_warm_precompile(self.fork);
+        while (address <= last) : (address += 1) {
             try self.mark_warm(address);
         }
         if (self.fork.at_least(.osaka)) try self.mark_warm(0x100);
+    }
+
+    fn maybe_warm_coinbase(self: *Vm) !void {
+        if (self.fork.at_least(.shanghai)) try self.mark_warm(self.env.coinbase);
     }
 
     fn warm_access_list(self: *Vm) !void {
@@ -1653,12 +1716,26 @@ const MessageParams = struct {
     value: u256,
 };
 
-fn memory_gas_delta(old_size: u32, new_size: u32) u64 {
-    return gas_mod.memory_expansion_gas(old_size, new_size);
-}
-
 fn init_code_gas(length: u32) u64 {
     return gas_mod.gas_init_code_word * @as(u64, (length + 31) / 32);
+}
+
+/// Charge memory expansion for one `(offset, length)` range. Length 0 is a no-op.
+fn expand_memory(frame: *Frame, offset: u256, length: u256) !void {
+    const old_size = frame.memory.size();
+    const new_size = try memory_mod.grow_end(old_size, offset, length);
+    try frame.gas.consume_memory(old_size, new_size);
+    if (new_size > frame.memory.bytes.len) return error.MemoryOverflow;
+    try frame.memory.expand_range(offset, length);
+}
+
+fn expand_memory_union(frame: *Frame, a_off: u256, a_len: u256, b_off: u256, b_len: u256) !void {
+    const old_size = frame.memory.size();
+    const new_size = try memory_mod.expansion_union(old_size, a_off, a_len, b_off, b_len);
+    try frame.gas.consume_memory(old_size, new_size);
+    if (new_size > frame.memory.bytes.len) return error.MemoryOverflow;
+    try frame.memory.expand_range(a_off, a_len);
+    try frame.memory.expand_range(b_off, b_len);
 }
 
 fn exec_stop(frame: *Frame) u32 {
@@ -1672,8 +1749,7 @@ fn exec_push(frame: *Frame, opcode: opcode_mod.Opcode) !u32 {
         try frame.stack.push(0);
         return frame.pc + 1;
     }
-    const immediate = opcode_mod.read_push_immediate(frame.code, frame.pc + 1, width) orelse
-        return error.InvalidJump;
+    const immediate = opcode_mod.read_push_immediate(frame.code, frame.pc + 1, width);
     try frame.stack.push(immediate);
     return frame.pc + 1 + width;
 }
@@ -1783,29 +1859,26 @@ fn exec_pop(frame: *Frame) !u32 {
 }
 
 fn exec_mload(frame: *Frame) !u32 {
-    const offset = try word.to_u32(try frame.stack.pop());
-    const old_size = frame.memory.size();
-    const value = try frame.memory.load(offset);
-    try frame.gas.consume_memory(old_size, frame.memory.size());
+    const offset = try frame.stack.pop();
+    try expand_memory(frame, offset, 32);
+    const value = try frame.memory.load(@intCast(offset));
     try frame.stack.push(value);
     return frame.pc + 1;
 }
 
 fn exec_mstore(frame: *Frame) !u32 {
-    const offset = try word.to_u32(try frame.stack.pop());
+    const offset = try frame.stack.pop();
     const value = try frame.stack.pop();
-    const old_size = frame.memory.size();
-    try frame.memory.store(offset, value);
-    try frame.gas.consume_memory(old_size, frame.memory.size());
+    try expand_memory(frame, offset, 32);
+    try frame.memory.store(@intCast(offset), value);
     return frame.pc + 1;
 }
 
 fn exec_mstore8(frame: *Frame) !u32 {
-    const offset = try word.to_u32(try frame.stack.pop());
+    const offset = try frame.stack.pop();
     const value = try frame.stack.pop();
-    const old_size = frame.memory.size();
-    try frame.memory.store_byte(offset, @truncate(value));
-    try frame.gas.consume_memory(old_size, frame.memory.size());
+    try expand_memory(frame, offset, 1);
+    try frame.memory.store_byte(@intCast(offset), @truncate(value));
     return frame.pc + 1;
 }
 
@@ -1864,13 +1937,15 @@ fn exec_jumpi(frame: *Frame) !u32 {
 }
 
 fn exec_calldataload(frame: *Frame) !u32 {
-    const offset = try word.to_u32(try frame.stack.pop());
+    const offset = try frame.stack.pop();
     var word_bytes: [32]u8 = undefined;
     @memset(&word_bytes, 0);
     var index: u32 = 0;
     while (index < 32) : (index += 1) {
-        const source = offset + index;
-        if (source < frame.calldata.len) word_bytes[index] = frame.calldata[source];
+        const source = @addWithOverflow(offset, @as(u256, index));
+        if (source[1] == 0 and source[0] < frame.calldata.len) {
+            word_bytes[index] = frame.calldata[@intCast(source[0])];
+        }
     }
     try frame.stack.push(word.from_bytes_be(&word_bytes));
     return frame.pc + 1;
@@ -1885,19 +1960,12 @@ fn exec_codecopy(frame: *Frame) !u32 {
 }
 
 fn exec_copy_from(frame: *Frame, source: []const u8) !u32 {
-    const dest = try word.to_u32(try frame.stack.pop());
-    const offset = try word.to_u32(try frame.stack.pop());
-    const size = try word.to_u32(try frame.stack.pop());
+    const dest = try frame.stack.pop();
+    const offset = try frame.stack.pop();
+    const size = try frame.stack.pop();
     try frame.gas.consume_copy(size);
-    const old_size = frame.memory.size();
-    try frame.memory.expand(dest, size);
-    try frame.gas.consume_memory(old_size, frame.memory.size());
-    var index: u32 = 0;
-    while (index < size) : (index += 1) {
-        const src = offset + index;
-        const byte: u8 = if (src < source.len) source[src] else 0;
-        try frame.memory.store_byte(dest + index, byte);
-    }
+    try expand_memory(frame, dest, size);
+    try frame.memory.write_from(dest, offset, size, source);
     return frame.pc + 1;
 }
 

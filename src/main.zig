@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "jsontest")) {
-        // Arena `destroy` is a no-op; each case heap-allocates a ~100MB Vm.
+        // Arena `destroy` is a no-op; each case heap-allocates a ~1GB Vm.
         var heap: std.heap.DebugAllocator(.{}) = .init;
         defer _ = heap.deinit();
         const result = jsontest_command(stdout, heap.allocator(), init.io, args[2..]);
@@ -76,29 +76,32 @@ pub fn main(init: std.process.Init) !void {
 fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
     try writer.print(
         \\Usage:
-        \\  {s} run [--fork prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] <hex-bytecode> [hex-calldata]
-        \\  {s} debug [--fork prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] [--gas N] <hex-bytecode> [hex-calldata] <cmd> [k=v...]
-        \\  {s} debug [--fork prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] --match-test <name> [--match-contract <name>] [out-dir] <cmd> [k=v...]
-        \\  {s} forge-test [--fork prague|osaka|amsterdam|osaka_breakpoint] [out-dir]
-        \\  {s} jsontest [--fork prague|osaka|amsterdam] [file-or-dir]
-        \\  {s} chaintest [--fork prague|osaka|amsterdam] [file-or-dir]
+        \\  {s} run [--fork paris|shanghai|cancun|prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] <hex-bytecode> [hex-calldata]
+        \\  {s} debug [--fork paris|shanghai|cancun|prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] [--gas N] <hex-bytecode> [hex-calldata] <cmd> [k=v...]
+        \\  {s} debug [--fork paris|shanghai|cancun|prague|osaka|amsterdam|prague_breakpoint|osaka_breakpoint|amsterdam_breakpoint] --match-test <name> [--match-contract <name>] [out-dir] <cmd> [k=v...]
+        \\  {s} forge-test [--fork paris|shanghai|cancun|prague|osaka|amsterdam|osaka_breakpoint] [out-dir]
+        \\  {s} jsontest [--fork paris|shanghai|cancun|prague|osaka|amsterdam] [--jobs N] [file-or-dir]
+        \\  {s} chaintest [--fork paris|shanghai|cancun|prague|osaka|amsterdam] [--jobs N] [file-or-dir]
         \\  {s} test-bytecode
         \\
         \\Default fork is osaka. `run` is a plain EVM (no hevm cheatcodes).
         \\`debug` prints JSON for LLM traces: overview, state, step, pc, opcode,
         \\call-tree, storage-diff, explain, trace, diff.
         \\`0xcc` is BREAKPOINT only on `prague_breakpoint` / `osaka_breakpoint` /
-        \\`amsterdam_breakpoint`. Prague, Osaka, and Amsterdam treat it as invalid.
+        \\`amsterdam_breakpoint`. Spec forks treat it as invalid.
         \\`--match-test` loads a `forge-test` artifact and traces setUp plus the
         \\test call with hevm cheatcodes (constructor is omitted). Default dir is `out`.
         \\`forge-test` enables Foundry cheatcodes at 0x7109… and runs `test*`
         \\functions from `forge build` artifacts (no fuzz or invariants).
         \\`jsontest` runs EEST / GeneralStateTests JSON from
         \\`tests/eest/state_tests` (fetch with scripts/fetch_eest_fixtures.sh).
-        \\A 32-byte post.hash is the Merkle Patricia state root. EIP-6780 is
-        \\included (Osaka SELFDESTRUCT); pre-Cancun posts for it are skipped.
-        \\`chaintest` runs EEST blockchain_tests (valid blocks: skip exceptions,
-        \\uncles). Fetch with
+        \\A 32-byte post.hash is the Merkle Patricia state root. Each post runs
+        \\on its own fork (Paris, Shanghai, Cancun, Prague, Osaka). `--fork`
+        \\is a ceiling: later posts are skipped. Pre-Paris posts are skipped.
+        \\`--jobs N` runs fixture files on N threads (0 = CPU count). Each worker
+        \\keeps one VM. `chaintest` runs EEST blockchain_tests. Invalid blocks with a decoded
+        \\header are applied and must fail. RLP-only fixtures are skipped.
+        \\Fetch with
         \\scripts/fetch_eest_fixtures.sh --blockchain.
         \\
         \\Examples:
@@ -108,7 +111,7 @@ fn print_usage(writer: *std.Io.Writer, program: []const u8) !void {
         \\  {s} debug --fork osaka_breakpoint 0x6001cc opcode opcode=BREAKPOINT
         \\  {s} debug --fork osaka_breakpoint --match-test testFoo overview
         \\  {s} forge-test out
-        \\  {s} jsontest
+        \\  {s} jsontest --jobs 0
         \\  {s} chaintest
         \\
     , .{
@@ -243,21 +246,40 @@ fn forge_test_command(
     if (summary.failed != 0) return error.ForgeTestsFailed;
 }
 
+fn parse_test_flags(args: []const [:0]const u8) !struct {
+    fork: evm.Fork,
+    jobs: u32,
+    rest: []const [:0]const u8,
+} {
+    var rest = args;
+    var fork: evm.Fork = .osaka;
+    var jobs: u32 = 1;
+    while (rest.len >= 2) {
+        if (std.mem.eql(u8, rest[0], "--fork")) {
+            fork = evm.Fork.from_name(rest[1]) orelse return error.UnknownFork;
+            rest = rest[2..];
+            continue;
+        }
+        if (std.mem.eql(u8, rest[0], "--jobs")) {
+            jobs = std.fmt.parseInt(u32, rest[1], 10) catch return error.InvalidJobs;
+            rest = rest[2..];
+            continue;
+        }
+        break;
+    }
+    return .{ .fork = fork, .jobs = jobs, .rest = rest };
+}
+
 fn jsontest_command(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     io: std.Io,
     args: []const [:0]const u8,
 ) !void {
-    var rest = args;
-    var fork: evm.Fork = .osaka;
-    if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--fork")) {
-        fork = evm.Fork.from_name(rest[1]) orelse return error.UnknownFork;
-        rest = rest[2..];
-    }
-    const path = if (rest.len >= 1) rest[0] else jsontest.default_path;
-    const summary = jsontest.run_path(allocator, io, path, writer, fork) catch |err| {
-        if (rest.len == 0) {
+    const flags = try parse_test_flags(args);
+    const path = if (flags.rest.len >= 1) flags.rest[0] else jsontest.default_path;
+    const summary = jsontest.run_path(allocator, io, path, writer, flags.fork, flags.jobs) catch |err| {
+        if (flags.rest.len == 0) {
             try writer.print(
                 "missing {s}; run scripts/fetch_eest_fixtures.sh\n",
                 .{path},
@@ -279,15 +301,10 @@ fn chaintest_command(
     io: std.Io,
     args: []const [:0]const u8,
 ) !void {
-    var rest = args;
-    var fork: evm.Fork = .osaka;
-    if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--fork")) {
-        fork = evm.Fork.from_name(rest[1]) orelse return error.UnknownFork;
-        rest = rest[2..];
-    }
-    const path = if (rest.len >= 1) rest[0] else chaintest.default_path;
-    const summary = chaintest.run_path(allocator, io, path, writer, fork) catch |err| {
-        if (rest.len == 0) {
+    const flags = try parse_test_flags(args);
+    const path = if (flags.rest.len >= 1) flags.rest[0] else chaintest.default_path;
+    const summary = chaintest.run_path(allocator, io, path, writer, flags.fork, flags.jobs) catch |err| {
+        if (flags.rest.len == 0) {
             try writer.print(
                 "missing {s}; run scripts/fetch_eest_fixtures.sh --blockchain\n",
                 .{path},

@@ -13,6 +13,7 @@ pub const empty_code_hash = hex32("c5d2460186f7233c927e7db2dcc703c0e500b653ca822
 
 const Leaf = struct {
     path: [64]u8,
+    path_len: u32,
     value_off: u32,
     value_len: u32,
 };
@@ -38,6 +39,8 @@ pub const Trie = struct {
     values: [limits.trie_value_bytes_max]u8,
     value_used: u32,
     root: u32,
+    encode_payload_buf: [limits.trie_node_bytes_max]u8,
+    encode_rlp_buf: [limits.trie_node_bytes_max]u8,
 
     pub fn reset(self: *Trie) void {
         self.leaf_count = 0;
@@ -79,6 +82,23 @@ pub const Trie = struct {
         return self.root_hash();
     }
 
+    /// Unhashed MPT: keys are raw bytes (tx/receipt/withdrawal index RLP).
+    pub fn indexed_root(self: *Trie, items: []const []const u8) ![32]u8 {
+        self.reset();
+        std.debug.assert(items.len <= limits.trie_leaves_max);
+        var i: u32 = 0;
+        while (i < items.len) : (i += 1) {
+            try self.insert_indexed(i, items[i]);
+        }
+        return self.root_hash();
+    }
+
+    pub fn insert_indexed(self: *Trie, index: u32, value: []const u8) !void {
+        var key: [limits.indexed_trie_key_bytes_max]u8 = undefined;
+        const key_n = rlp.uint(&key, index);
+        try self.push_raw(key[0..key_n], value);
+    }
+
     fn storage_root(self: *Trie, world: *const world_mod.World, address: u256) ![32]u8 {
         self.clear_tree();
         var index: u32 = 0;
@@ -108,8 +128,29 @@ pub const Trie = struct {
         to_nibbles(&key, &path);
         self.leaves[self.leaf_count] = .{
             .path = path,
+            .path_len = 64,
             .value_off = off,
             .value_len = len,
+        };
+        self.leaf_count += 1;
+    }
+
+    fn push_raw(self: *Trie, key: []const u8, value: []const u8) !void {
+        std.debug.assert(key.len != 0);
+        std.debug.assert(key.len * 2 <= 64);
+        if (self.leaf_count >= limits.trie_leaves_max) return error.TrieFull;
+        var path: [64]u8 = undefined;
+        var i: u32 = 0;
+        while (i < key.len) : (i += 1) {
+            path[i * 2] = key[i] >> 4;
+            path[i * 2 + 1] = key[i] & 0x0f;
+        }
+        const off = try self.copy_value(value);
+        self.leaves[self.leaf_count] = .{
+            .path = path,
+            .path_len = @intCast(key.len * 2),
+            .value_off = off,
+            .value_len = @intCast(value.len),
         };
         self.leaf_count += 1;
     }
@@ -127,7 +168,7 @@ pub const Trie = struct {
         return off;
     }
 
-    fn root_hash(self: *Trie) error{TrieFull}![32]u8 {
+    pub fn root_hash(self: *Trie) error{TrieFull}![32]u8 {
         if (self.leaf_count == 0) return empty_root;
         sort_leaves(self.leaves[0..self.leaf_count]);
         dedup_leaves(&self.leaf_count, self.leaves[0..self.leaf_count]);
@@ -140,9 +181,10 @@ pub const Trie = struct {
         std.debug.assert(lo < hi);
         if (lo + 1 == hi) {
             const leaf = self.leaves[lo];
-            return self.new_leaf(leaf.path[key_off..64], leaf.value_off, leaf.value_len);
+            std.debug.assert(key_off <= leaf.path_len);
+            return self.new_leaf(leaf.path[key_off..leaf.path_len], leaf.value_off, leaf.value_len);
         }
-        const shared = shared_prefix(self.leaves[lo].path, self.leaves[hi - 1].path, key_off);
+        const shared = shared_prefix(self.leaves[lo], self.leaves[hi - 1], key_off);
         if (shared != 0) {
             const child = try self.build(lo, hi, key_off + shared);
             return self.new_ext(self.leaves[lo].path[key_off .. key_off + shared], child);
@@ -153,10 +195,22 @@ pub const Trie = struct {
     fn new_branch(self: *Trie, lo: u32, hi: u32, key_off: u32) error{TrieFull}!u32 {
         var children: [16]u32 = @splat(0);
         var cursor = lo;
+        var value_off: u32 = 0;
+        var value_len: u32 = 0;
+        while (cursor < hi and self.leaves[cursor].path_len == key_off) {
+            std.debug.assert(value_len == 0);
+            value_off = self.leaves[cursor].value_off;
+            value_len = self.leaves[cursor].value_len;
+            std.debug.assert(value_len != 0);
+            cursor += 1;
+        }
         var nibble: u32 = 0;
         while (nibble < 16) : (nibble += 1) {
             const start = cursor;
-            while (cursor < hi and self.leaves[cursor].path[key_off] == nibble) cursor += 1;
+            while (cursor < hi and self.leaves[cursor].path[key_off] == nibble) {
+                std.debug.assert(self.leaves[cursor].path_len > key_off);
+                cursor += 1;
+            }
             if (start == cursor) continue;
             children[nibble] = try self.build(start, cursor, key_off + 1);
         }
@@ -166,8 +220,8 @@ pub const Trie = struct {
             .kind = .branch,
             .path = undefined,
             .path_len = 0,
-            .value_off = 0,
-            .value_len = 0,
+            .value_off = value_off,
+            .value_len = value_len,
             .children = children,
             .ref = undefined,
             .ref_len = 0,
@@ -224,16 +278,14 @@ pub const Trie = struct {
     }
 
     fn seal(self: *Trie, idx: u32) void {
-        var payload: [limits.trie_node_bytes_max]u8 = undefined;
-        const pay = self.encode_payload(idx, &payload);
-        var encoded: [limits.trie_node_bytes_max]u8 = undefined;
-        const n = rlp.list(encoded[0..], payload[0..pay]);
+        const pay = self.encode_payload(idx, &self.encode_payload_buf);
+        const n = rlp.list(self.encode_rlp_buf[0..], self.encode_payload_buf[0..pay]);
         if (n < 32) {
             self.nodes[idx].ref_len = n;
-            @memcpy(self.nodes[idx].ref[0..n], encoded[0..n]);
+            @memcpy(self.nodes[idx].ref[0..n], self.encode_rlp_buf[0..n]);
         } else {
             self.nodes[idx].ref_len = 32;
-            rlp.keccak(encoded[0..n], &self.nodes[idx].ref);
+            rlp.keccak(self.encode_rlp_buf[0..n], &self.nodes[idx].ref);
         }
     }
 
@@ -258,8 +310,12 @@ pub const Trie = struct {
                 while (child_i < 16) : (child_i += 1) {
                     n += self.write_ref(out[n..], node.children[child_i]);
                 }
-                out[n] = 0x80;
-                n += 1;
+                if (node.value_len == 0) {
+                    out[n] = 0x80;
+                    n += 1;
+                } else {
+                    n += rlp.bytes(out[n..], self.values[node.value_off .. node.value_off + node.value_len]);
+                }
             },
         }
         return n;
@@ -317,9 +373,9 @@ fn pack_nibbles(nibbles: []const u8, out: []u8) u32 {
     return o;
 }
 
-fn shared_prefix(a: [64]u8, b: [64]u8, off: u32) u32 {
+fn shared_prefix(a: Leaf, b: Leaf, off: u32) u32 {
     var n: u32 = 0;
-    while (off + n < 64 and a[off + n] == b[off + n]) n += 1;
+    while (off + n < a.path_len and off + n < b.path_len and a.path[off + n] == b.path[off + n]) n += 1;
     return n;
 }
 
@@ -327,7 +383,7 @@ fn sort_leaves(items: []Leaf) void {
     var i: u32 = 1;
     while (i < items.len) : (i += 1) {
         var j = i;
-        while (j > 0 and path_less(items[j].path, items[j - 1].path)) {
+        while (j > 0 and path_less(items[j], items[j - 1])) {
             const tmp = items[j];
             items[j] = items[j - 1];
             items[j - 1] = tmp;
@@ -336,13 +392,19 @@ fn sort_leaves(items: []Leaf) void {
     }
 }
 
-fn path_less(a: [64]u8, b: [64]u8) bool {
+fn path_less(a: Leaf, b: Leaf) bool {
+    const n = @min(a.path_len, b.path_len);
     var i: u32 = 0;
-    while (i < 64) : (i += 1) {
-        if (a[i] < b[i]) return true;
-        if (a[i] > b[i]) return false;
+    while (i < n) : (i += 1) {
+        if (a.path[i] < b.path[i]) return true;
+        if (a.path[i] > b.path[i]) return false;
     }
-    return false;
+    return a.path_len < b.path_len;
+}
+
+fn path_eql(a: Leaf, b: Leaf) bool {
+    if (a.path_len != b.path_len) return false;
+    return std.mem.eql(u8, a.path[0..a.path_len], b.path[0..b.path_len]);
 }
 
 fn dedup_leaves(count: *u32, items: []Leaf) void {
@@ -350,7 +412,7 @@ fn dedup_leaves(count: *u32, items: []Leaf) void {
     var w: u32 = 1;
     var r: u32 = 1;
     while (r < count.*) : (r += 1) {
-        if (std.mem.eql(u8, &items[r].path, &items[w - 1].path)) {
+        if (path_eql(items[r], items[w - 1])) {
             items[w - 1] = items[r];
             continue;
         }
@@ -409,4 +471,29 @@ test "nonce-1 eoa has a nonempty state root" {
     trie.reset();
     const root = try trie.world_root(&world);
     try std.testing.expect(!std.mem.eql(u8, &root, &empty_root));
+}
+
+test "empty indexed trie is empty root" {
+    const trie = try std.testing.allocator.create(Trie);
+    defer std.testing.allocator.destroy(trie);
+    const root = try trie.indexed_root(&.{});
+    try std.testing.expectEqualSlices(u8, &empty_root, &root);
+}
+
+test "indexed trie of one value is not empty" {
+    const trie = try std.testing.allocator.create(Trie);
+    defer std.testing.allocator.destroy(trie);
+    const items = [_][]const u8{"hi"};
+    const root = try trie.indexed_root(&items);
+    try std.testing.expect(!std.mem.eql(u8, &root, &empty_root));
+}
+
+test "indexed trie two values differs from one" {
+    const trie = try std.testing.allocator.create(Trie);
+    defer std.testing.allocator.destroy(trie);
+    const one = [_][]const u8{"hi"};
+    const two = [_][]const u8{ "hi", "yo" };
+    const a = try trie.indexed_root(&one);
+    const b = try trie.indexed_root(&two);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }

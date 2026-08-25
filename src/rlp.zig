@@ -97,11 +97,46 @@ pub fn list(out: []u8, payload: []const u8) u32 {
     return 1 + len_len + @as(u32, @intCast(payload.len));
 }
 
-fn encode_address(out: []u8, address: u256) u32 {
+/// Room for the longest RLP list prefix (`0xf7` + 8-byte length).
+pub const list_header_room: u32 = 9;
+
+/// `out[hdr_room .. end]` is already the list payload. Slide it down and write
+/// the header at `out[0]` so the result does not need a second copy buffer.
+pub fn wrap_list(out: []u8, hdr_room: u32, end: u32) u32 {
+    std.debug.assert(hdr_room == list_header_room);
+    std.debug.assert(end >= hdr_room);
+    const payload_len = end - hdr_room;
+    const hdr_len = list_header_len(payload_len);
+    std.debug.assert(hdr_len <= hdr_room);
+    if (hdr_len != hdr_room and payload_len != 0) {
+        std.mem.copyForwards(u8, out[hdr_len .. hdr_len + payload_len], out[hdr_room..end]);
+    }
+    write_list_header(out, payload_len);
+    return hdr_len + payload_len;
+}
+
+fn list_header_len(payload_len: usize) u32 {
+    if (payload_len < 56) return 1;
+    return 1 + uint_width(payload_len);
+}
+
+fn write_list_header(out: []u8, payload_len: usize) void {
+    if (payload_len < 56) {
+        std.debug.assert(out.len >= 1);
+        out[0] = 0xc0 + @as(u8, @intCast(payload_len));
+        return;
+    }
+    const len_len = uint_width(payload_len);
+    std.debug.assert(out.len >= 1 + len_len);
+    out[0] = 0xf7 + len_len;
+    write_uint(out[1..], payload_len, len_len);
+}
+
+pub fn encode_address(out: []u8, addr: u256) u32 {
     std.debug.assert(out.len >= 21);
     out[0] = 0x94;
     var be: [32]u8 = undefined;
-    word.to_bytes_be(address, &be);
+    word.to_bytes_be(addr, &be);
     @memcpy(out[1..21], be[12..32]);
     return 21;
 }
@@ -142,4 +177,16 @@ test "rlp empty list is 0xc0" {
     var out: [1]u8 = undefined;
     try std.testing.expectEqual(@as(u32, 1), list(&out, &[_]u8{}));
     try std.testing.expectEqual(@as(u8, 0xc0), out[0]);
+}
+
+test "wrap_list matches list" {
+    var src: [80]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = @truncate(i);
+    var via_copy: [100]u8 = undefined;
+    const n = list(&via_copy, src[0..80]);
+    var via_wrap: [100]u8 = undefined;
+    @memcpy(via_wrap[9..89], src[0..80]);
+    const m = wrap_list(&via_wrap, 9, 89);
+    try std.testing.expectEqual(n, m);
+    try std.testing.expectEqualSlices(u8, via_copy[0..n], via_wrap[0..m]);
 }

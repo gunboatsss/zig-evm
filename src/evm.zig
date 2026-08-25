@@ -18,11 +18,12 @@ pub const AccessListItem = interpreter.AccessListItem;
 pub const Authorization = interpreter.Authorization;
 pub const BlockTx = interpreter.BlockTx;
 pub const Withdrawal = interpreter.Withdrawal;
+pub const TxKind = interpreter.TxKind;
 
 pub const Result = struct {
     status: Status,
     gas_used: u64,
-    return_buffer: [limits.returndata_bytes_max]u8,
+    return_buffer: [limits.execute_return_bytes_max]u8,
     return_len: u32,
     log_count: u32,
 
@@ -58,10 +59,9 @@ pub fn execute_with_fork(
         .status = vm.current().status,
         .gas_used = vm.current().gas.used,
         .return_buffer = undefined,
-        .return_len = vm.output_len,
+        .return_len = @intCast(@min(vm.output_len, limits.execute_return_bytes_max)),
         .log_count = vm.log_count,
     };
-    std.debug.assert(result.return_len <= limits.returndata_bytes_max);
     @memcpy(
         result.return_buffer[0..result.return_len],
         vm.output_buffer[0..result.return_len],
@@ -164,6 +164,27 @@ test "apply_tx blob fee is burned not tipped" {
     try std.testing.expectEqual(@as(u64, 131_072), vm.tx_blob_gas_used);
 }
 
+test "apply_tx blob max fee is a cap not a mid-execution debit" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    // ORIGIN BALANCE PUSH1 0 SSTORE STOP
+    const code = [_]u8{ 0x32, 0x31, 0x60, 0x00, 0x55, 0x00 };
+    try vm.world.set_code(0xaa, &code);
+    try vm.world.set_balance(1, 262_144);
+    vm.env.gas_price = 0;
+    vm.env.base_fee = 0;
+    vm.env.blob_base_fee = 1;
+    vm.env.origin = 1;
+    const hashes = [_][32]u8{versioned_blob_hash()};
+    vm.blob_versioned_hashes = &hashes;
+    vm.max_fee_per_blob_gas = 2;
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expectEqual(@as(u256, 131_072), vm.world.load(0xaa, 0));
+    try std.testing.expectEqual(@as(u256, 131_072), vm.world.get_balance(1));
+}
+
 test "apply_tx blob create is invalid" {
     const vm = try std.testing.allocator.create(Vm);
     defer std.testing.allocator.destroy(vm);
@@ -202,6 +223,19 @@ test "apply_tx more than nine blobs is over the schedule" {
     defer std.testing.allocator.destroy(vm);
     vm.init_plain(.osaka);
     var hashes: [10][32]u8 = undefined;
+    for (&hashes) |*hash| {
+        hash.* = versioned_blob_hash();
+    }
+    vm.blob_versioned_hashes = &hashes;
+    vm.max_fee_per_blob_gas = 1;
+    try std.testing.expectError(error.BlobLimit, vm.apply_tx(0xaa, &[_]u8{}, 21_000, 0, 1));
+}
+
+test "apply_tx cancun more than six blobs is over the schedule" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.cancun);
+    var hashes: [7][32]u8 = undefined;
     for (&hashes) |*hash| {
         hash.* = versioned_blob_hash();
     }
@@ -367,6 +401,100 @@ test "mcopy huge dest zero length succeeds" {
     try std.testing.expectEqual(Status.stopped, result.status);
 }
 
+test "calldatacopy huge dest zero length succeeds" {
+    var code: [38]u8 = undefined;
+    code[0] = 0x60;
+    code[1] = 0x00;
+    code[2] = 0x60;
+    code[3] = 0x00;
+    code[4] = 0x7f;
+    @memset(code[5..37], 0xff);
+    code[37] = 0x37;
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "apply_message accepts calldata larger than 128KiB" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const data = try std.testing.allocator.alloc(u8, 129 * 1024);
+    defer std.testing.allocator.free(data);
+    @memset(data, 0);
+    const status = try vm.apply_message(0xaa, data, 21_000, 0, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, status);
+}
+
+test "calldataload huge offset returns zero" {
+    var code: [72]u8 = undefined;
+    code[0] = 0x7f;
+    @memset(code[1..33], 0xff);
+    code[33] = 0x35;
+    code[34] = 0x60;
+    code[35] = 0x00;
+    code[36] = 0x52;
+    code[37] = 0x60;
+    code[38] = 0x20;
+    code[39] = 0x60;
+    code[40] = 0x00;
+    code[41] = 0xf3;
+    const result = try execute(std.testing.allocator, &code, "abcd", 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.return_data()[31]);
+}
+
+test "call huge in offset zero size succeeds" {
+    // out_size, out_offset, in_size=0, in_offset=2^256-1, value, address, gas, CALL STOP
+    var code: [47]u8 = undefined;
+    code[0] = 0x60;
+    code[1] = 0x00;
+    code[2] = 0x60;
+    code[3] = 0x00;
+    code[4] = 0x60;
+    code[5] = 0x00;
+    code[6] = 0x7f;
+    @memset(code[7..39], 0xff);
+    code[39] = 0x60;
+    code[40] = 0x00;
+    code[41] = 0x60;
+    code[42] = 0x00;
+    code[43] = 0x5a;
+    code[44] = 0xf1;
+    code[45] = 0x50;
+    code[46] = 0x00;
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "truncated push2 at end of code stops" {
+    // PUSH2 0x00 (one immediate byte missing) — Yellow Paper zero-pads, then halt.
+    const code = [_]u8{ 0x61, 0x00 };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "return huge offset zero size succeeds" {
+    var code: [36]u8 = undefined;
+    code[0] = 0x60;
+    code[1] = 0x00;
+    code[2] = 0x7f;
+    @memset(code[3..35], 0xff);
+    code[35] = 0xf3;
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.returned, result.status);
+    try std.testing.expectEqual(@as(usize, 0), result.return_data().len);
+}
+
+test "return 73760 bytes succeeds" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    const code = [_]u8{ 0x62, 0x01, 0x20, 0x20, 0x60, 0x00, 0xf3 };
+    try vm.init(&code, &[_]u8{}, 1_000_000, ExecutionContext.default(), .osaka);
+    try vm.run();
+    try std.testing.expectEqual(Status.returned, vm.current().status);
+    try std.testing.expectEqual(@as(u32, 0x012020), vm.output_len);
+}
+
 test "apply_tx access list adds intrinsic gas" {
     const vm = try std.testing.allocator.create(Vm);
     defer std.testing.allocator.destroy(vm);
@@ -432,6 +560,49 @@ test "create then selfdestruct deletes new account" {
     try std.testing.expect(!vm.world.is_alive(created));
 }
 
+test "apply_tx create collision burns remaining gas" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_balance(1, 1_000_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const created = rlp.create_address(1, 0);
+    try vm.world.set_nonce(created, 1);
+    const status = try vm.apply_tx(null, &[_]u8{0x00}, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.faulted, status);
+    try std.testing.expectEqual(@as(u64, 1), vm.world.get_nonce(1));
+    try std.testing.expectEqual(@as(u256, 900_000), vm.world.get_balance(1));
+    try std.testing.expectEqual(@as(u256, 100_000), vm.world.get_balance(2));
+}
+
+test "push0 is invalid on paris and valid on shanghai" {
+    const code = [_]u8{ 0x5f, 0x00 };
+    try std.testing.expectError(
+        error.InvalidOpcode,
+        execute_with_fork(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default(), .paris),
+    );
+    const shanghai = try execute_with_fork(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default(), .shanghai);
+    try std.testing.expectEqual(Status.stopped, shanghai.status);
+}
+
+test "selfdestruct shanghai deletes a pre-existing account" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.shanghai);
+    try vm.world.set_balance(1, 1_000_000);
+    try vm.world.set_code(0xaa, &.{ 0x60, 0x04, 0xff });
+    try vm.world.set_balance(0xaa, 1_000);
+    vm.env.gas_price = 1;
+    vm.env.base_fee = 0;
+    vm.env.coinbase = 2;
+    const status = try vm.apply_tx(0xaa, &[_]u8{}, 100_000, 0, 1);
+    try std.testing.expectEqual(Status.stopped, status);
+    try std.testing.expect(!vm.world.is_alive(0xaa));
+    try std.testing.expectEqual(@as(u256, 1_000), vm.world.get_balance(4));
+}
+
 test "call empty account returns one" {
     // CALL into address 2 (warm, no precompile, no code) and RETURN the success flag.
     const code = [_]u8{
@@ -463,6 +634,24 @@ test "self call stops at stack depth limit" {
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 10_000_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.stopped, result.status);
+}
+
+test "returndatacopy wrapping offset faults" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    try vm.world.set_code(0xaa, &.{ 0x60, 0x01, 0x60, 0x00, 0xf3 });
+    const code = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0xaa, 0x61, 0x27, 0x10, 0xf1, 0x50, 0x60, 0x02, 0x63,
+        0xff, 0xff, 0xff, 0xff, 0x60, 0x00, 0x3e, 0x00,
+    };
+    try vm.world.set_code(0xbb, &code);
+    var ctx = ExecutionContext.default();
+    ctx.caller = 0xbb;
+    ctx.origin = 0xbb;
+    const status = try vm.apply_call(0xbb, &.{}, 1_000_000, ctx);
+    try std.testing.expectEqual(Status.faulted, status);
 }
 
 test "create deploys empty contract" {
@@ -506,6 +695,18 @@ test "log0 records one log" {
     const code = [_]u8{
         0x60, 0x61, 0x60, 0x00, 0x53, // MSTORE8 0x61 at 0
         0x60, 0x01, 0x60, 0x00, 0xa0, // LOG0 size=1 offset=0
+        0x00,
+    };
+    const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
+    try std.testing.expectEqual(Status.stopped, result.status);
+    try std.testing.expectEqual(@as(u32, 1), result.log_count);
+}
+
+test "log0 of 40kb succeeds" {
+    const code = [_]u8{
+        0x61, 0xa0, 0x00, // PUSH2 40960
+        0x60, 0x00, // PUSH1 0
+        0xa0, // LOG0
         0x00,
     };
     const result = try execute(std.testing.allocator, &code, &[_]u8{}, 1_000_000, ExecutionContext.default());
@@ -575,6 +776,52 @@ test "identity precompile copies calldata" {
     const result = try execute(std.testing.allocator, &code, &calldata, 1_000_000, ExecutionContext.default());
     try std.testing.expectEqual(Status.returned, result.status);
     try std.testing.expectEqualSlices(u8, &calldata, result.return_data());
+}
+
+test "callcode with value succeeds inside staticcall" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const inner = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x01, 0x60, 0x04, 0x5a, 0xf2, 0x60, 0x00,
+        0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    try vm.world.set_code(0xaa, &inner);
+    try vm.world.set_balance(0xaa, 10);
+    try vm.world.set_code(0xbb, &[_]u8{
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0xaa, 0x61, 0xff, 0xff, 0xfa, 0x60, 0x20,
+        0x60, 0x00, 0xf3,
+    });
+    var ctx = ExecutionContext.default();
+    ctx.address = 0xbb;
+    const status = try vm.apply_message(0xbb, &[_]u8{}, 1_000_000, 0, ctx);
+    try std.testing.expectEqual(Status.returned, status);
+    try std.testing.expectEqual(@as(u8, 1), vm.output_buffer[31]);
+}
+
+test "call with value faults inside staticcall" {
+    const vm = try std.testing.allocator.create(Vm);
+    defer std.testing.allocator.destroy(vm);
+    vm.init_plain(.osaka);
+    const inner = [_]u8{
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0x01, 0x60, 0x04, 0x5a, 0xf1, 0x60, 0x00,
+        0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    };
+    try vm.world.set_code(0xaa, &inner);
+    try vm.world.set_balance(0xaa, 10);
+    try vm.world.set_code(0xbb, &[_]u8{
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+        0x60, 0xaa, 0x61, 0xff, 0xff, 0xfa, 0x15, 0x60,
+        0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    });
+    var ctx = ExecutionContext.default();
+    ctx.address = 0xbb;
+    const status = try vm.apply_message(0xbb, &[_]u8{}, 1_000_000, 0, ctx);
+    try std.testing.expectEqual(Status.returned, status);
+    try std.testing.expectEqual(@as(u8, 1), vm.output_buffer[31]);
 }
 
 test "ripemd160 precompile empty hash" {

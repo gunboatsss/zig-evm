@@ -1,5 +1,5 @@
-//! Opcode table for Osaka (baseline) and Amsterdam (additive).
-//! Byte values match `ethereum/execution-specs` `forks/osaka` and `forks/amsterdam`.
+//! Opcode table from Paris (London EVM) through Amsterdam.
+//! Byte values match `ethereum/execution-specs`.
 //! `BREAKPOINT` (`0xcc`) is zig-evm only: enabled on `*_breakpoint` forks.
 
 const std = @import("std");
@@ -168,12 +168,14 @@ pub const Opcode = enum(u8) {
         };
     }
 
-    /// Osaka is the baseline (`CLZ`). Amsterdam adds `SLOTNUM` and EIP-8024.
+    /// Paris is London EVM. Later forks add opcodes.
     pub fn introduced_in(opcode: Opcode) Fork {
         return switch (opcode) {
             .slotnum, .dupn, .swapn, .exchange => .amsterdam,
             .clz => .osaka,
-            else => .prague,
+            .tload, .tstore, .mcopy, .blobhash, .blobbasefee => .cancun,
+            .push0 => .shanghai,
+            else => .paris,
         };
     }
 
@@ -310,13 +312,19 @@ pub const Opcode = enum(u8) {
     }
 };
 
-pub fn read_push_immediate(code: []const u8, pc: u32, width: u32) ?u256 {
+/// Missing immediate bytes at the end of code are zero (Yellow Paper PUSH).
+pub fn read_push_immediate(code: []const u8, pc: u32, width: u32) u256 {
     std.debug.assert(width > 0);
     std.debug.assert(width <= 32);
-    if (pc + width > code.len) return null;
     var bytes: [32]u8 = undefined;
     @memset(&bytes, 0);
-    @memcpy(bytes[32 - width ..], code[pc .. pc + width]);
+    if (pc < code.len) {
+        const remaining: u32 = @intCast(code.len - pc);
+        const available = @min(width, remaining);
+        if (available > 0) {
+            @memcpy(bytes[32 - width .. 32 - width + available], code[pc .. pc + available]);
+        }
+    }
     return word.from_bytes_be(&bytes);
 }
 
@@ -371,6 +379,12 @@ test "push width" {
     try std.testing.expectEqual(@as(u32, 32), Opcode.push_width(.push32));
 }
 
+test "truncated push immediate is zero-padded" {
+    const code = [_]u8{ 0x01 };
+    try std.testing.expectEqual(@as(u256, 0x0100), read_push_immediate(&code, 0, 2));
+    try std.testing.expectEqual(@as(u256, 0), read_push_immediate(&code, 1, 2));
+}
+
 test "eip-8024 decode_single" {
     try std.testing.expectEqual(@as(u32, 145), decode_single(0));
     try std.testing.expectEqual(@as(u32, 17), decode_single(128));
@@ -418,4 +432,13 @@ test "clz is osaka, slotnum is amsterdam" {
     try std.testing.expect(!Opcode.enabled(.slotnum, .osaka));
     try std.testing.expect(Opcode.enabled(.slotnum, .amsterdam));
     try std.testing.expect(Opcode.enabled(.mcopy, .osaka));
+}
+
+test "push0 is shanghai, mcopy is cancun" {
+    try std.testing.expect(!Opcode.enabled(.push0, .paris));
+    try std.testing.expect(Opcode.enabled(.push0, .shanghai));
+    try std.testing.expect(!Opcode.enabled(.mcopy, .shanghai));
+    try std.testing.expect(Opcode.enabled(.mcopy, .cancun));
+    try std.testing.expect(!Opcode.enabled(.blobhash, .shanghai));
+    try std.testing.expect(Opcode.enabled(.blobhash, .cancun));
 }

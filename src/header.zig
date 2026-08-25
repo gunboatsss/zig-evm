@@ -48,7 +48,7 @@ pub const Header = struct {
         var n: u32 = 0;
         n += rlp.bytes(out[n..], &self.parent_hash);
         n += rlp.bytes(out[n..], &self.ommers_hash);
-        n += encode_address(out[n..], self.coinbase);
+        n += rlp.encode_address(out[n..], self.coinbase);
         n += rlp.bytes(out[n..], &self.state_root);
         n += rlp.bytes(out[n..], &self.transactions_root);
         n += rlp.bytes(out[n..], &self.receipts_root);
@@ -71,12 +71,6 @@ pub const Header = struct {
         return n;
     }
 };
-
-fn encode_address(out: []u8, address: u256) u32 {
-    var be: [32]u8 = undefined;
-    word.to_bytes_be(address, &be);
-    return rlp.bytes(out, be[12..32]);
-}
 
 /// Dummy parent chain for isolated state tests: each hash is `keccak256(rlp(header))`.
 pub fn fill_window(

@@ -15,14 +15,40 @@ const max_len: u32 = limits.modexp_len_bytes_max;
 const max_limbs = std.math.big.int.calcTwosCompLimbCount(max_len * 8);
 
 pub fn gas_cost(input: []const u8, fork: Fork) error{OutOfGas}!u64 {
-    const header = parse_header(input) orelse return error.OutOfGas;
+    const base_len = read_u256(input, 0);
+    const exp_len = read_u256(input, 32);
+    const mod_len = read_u256(input, 64);
+    if (fork.at_least(.osaka) and (base_len > max_len or exp_len > max_len or mod_len > max_len))
+        return error.OutOfGas;
+    const floor: u64 = if (fork.at_least(.osaka)) gas_mod.gas_modexp_min_osaka else gas_mod.gas_modexp_min_prague;
+    // Pre-Osaka complexity is `words²` with words=0, so gas is always the floor
+    // even when `exp_len` is huge. Osaka uses a 16-word floor instead, so the
+    // iteration count still matters (`zero-length-base-mod` is 4064, not 500).
+    if (base_len == 0 and mod_len == 0 and !fork.at_least(.osaka)) return floor;
+    if (base_len > std.math.maxInt(u32) or exp_len > std.math.maxInt(u32) or mod_len > std.math.maxInt(u32))
+        return std.math.maxInt(u64);
+    const header = Header{
+        .base_len = @intCast(base_len),
+        .exp_len = @intCast(exp_len),
+        .mod_len = @intCast(mod_len),
+    };
     const head = exponent_head(input, header);
     return price(header.base_len, header.mod_len, header.exp_len, head, fork);
 }
 
-pub fn execute(input: []const u8, out: []u8, _: Fork) error{ OutOfGas, OutputTooLarge }!u32 {
-    const header = parse_header(input) orelse return error.OutOfGas;
-    if (header.base_len == 0 and header.mod_len == 0) return 0;
+pub fn execute(input: []const u8, out: []u8, fork: Fork) error{ OutOfGas, OutputTooLarge }!u32 {
+    const base_len = read_u256(input, 0);
+    const exp_len = read_u256(input, 32);
+    const mod_len = read_u256(input, 64);
+    if (fork.at_least(.osaka) and (base_len > max_len or exp_len > max_len or mod_len > max_len))
+        return error.OutOfGas;
+    if (base_len == 0 and mod_len == 0) return 0;
+    if (base_len > max_len or exp_len > max_len or mod_len > max_len) return error.OutOfGas;
+    const header = Header{
+        .base_len = @intCast(base_len),
+        .exp_len = @intCast(exp_len),
+        .mod_len = @intCast(mod_len),
+    };
     if (header.mod_len > out.len) return error.OutputTooLarge;
 
     var base_buf: [max_len]u8 = undefined;
@@ -59,18 +85,6 @@ const Header = struct {
     exp_len: u32,
     mod_len: u32,
 };
-
-fn parse_header(input: []const u8) ?Header {
-    const base_len = read_u256(input, 0);
-    const exp_len = read_u256(input, 32);
-    const mod_len = read_u256(input, 64);
-    if (base_len > max_len or exp_len > max_len or mod_len > max_len) return null;
-    return .{
-        .base_len = @intCast(base_len),
-        .exp_len = @intCast(exp_len),
-        .mod_len = @intCast(mod_len),
-    };
-}
 
 fn read_u256(input: []const u8, offset: u32) u256 {
     var buf: [32]u8 = @splat(0);
@@ -231,4 +245,24 @@ test "osaka rejects length above 1024" {
     input[30] = 0x04;
     input[31] = 0x01;
     try std.testing.expectError(error.OutOfGas, gas_cost(&input, .osaka));
+}
+
+test "prague huge exp length with zero base and mod is the minimum" {
+    var input: [64]u8 = @splat(0);
+    input[32 + 20] = 0x04;
+    try std.testing.expectEqual(gas_mod.gas_modexp_min_prague, try gas_cost(&input, .prague));
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 0), try execute(&input, &out, .prague));
+    try std.testing.expectError(error.OutOfGas, gas_cost(&input, .osaka));
+}
+
+test "osaka zero-length base and mod still uses iteration gas" {
+    var input: [128]u8 = @splat(0);
+    input[63] = 32;
+    input[96] = 0x66;
+    input[97] = 0x0b;
+    input[98] = 0xfd;
+    try std.testing.expectEqual(@as(u64, 4064), try gas_cost(&input, .osaka));
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 0), try execute(&input, &out, .osaka));
 }
